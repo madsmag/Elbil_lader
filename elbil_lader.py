@@ -75,8 +75,7 @@ def eds_hent(datasaet, kolonner, start, slut):
         "sort": f"{kolonner[0]} asc",
         "limit": 0,
     }
-    r = requests.get(f"https://api.energidataservice.dk/dataset/{datasaet}", params=params, timeout=90)
-    r.raise_for_status()
+    r = hent_med_genforsoeg(f"https://api.energidataservice.dk/dataset/{datasaet}", params)
     return pd.DataFrame(r.json()["records"])
 
 
@@ -175,21 +174,40 @@ def laes_tariffer(df):
     return df.dropna(subset=["fra"])
 
 
+def hent_med_genforsoeg(url, params, forsoeg=6):
+    """GET med ventetid og nyt forsøg ved 429 (rate limit) og midlertidige serverfejl."""
+    for i in range(forsoeg):
+        r = requests.get(url, params=params, timeout=180)
+        if r.status_code not in (429, 500, 502, 503, 504):
+            r.raise_for_status()
+            return r
+        if i == forsoeg - 1:
+            break
+        try:
+            vent = float(r.headers.get("Retry-After", ""))
+        except ValueError:
+            vent = 10 * 2 ** i          # 10, 20, 40, 80, 160 sek.
+        vent = min(max(vent, 5), 180)
+        print(f"Energi Data Service svarede {r.status_code}. Venter {vent:.0f} sek. og prøver igen "
+              f"({i + 1}/{forsoeg - 1}) ...")
+        time.sleep(vent)
+    sys.exit(f"Energi Data Service afviser stadig ({r.status_code}). Vent et par minutter og prøv igen.")
+
+
 def hent_tariffer(refresh):
     fil = CACHE / "tariffer.csv"
     if frisk(fil, refresh, 12):
         return laes_tariffer(pd.read_csv(fil, dtype=str))
     idag = pd.Timestamp.now(tz=TZ).normalize().tz_localize(None)
-    start = (idag - pd.Timedelta(days=4 * 365)).strftime("%Y-%m-%d")
+    start = (idag - pd.Timedelta(days=3 * 365)).strftime("%Y-%m-%d")
     slut = (idag + pd.Timedelta(days=200)).strftime("%Y-%m-%d")
     dele = []
     for filt in ({"ChargeType": ["D03"]}, {"ChargeTypeCode": list(ENERGINET_KODER.values())}):
         params = {"start": start, "end": slut, "filter": json.dumps(filt),
                   "columns": ",".join(TARIF_KOL), "limit": 0}
-        r = requests.get("https://api.energidataservice.dk/dataset/DatahubPricelist",
-                         params=params, timeout=180)
-        r.raise_for_status()
+        r = hent_med_genforsoeg("https://api.energidataservice.dk/dataset/DatahubPricelist", params)
         dele.append(pd.DataFrame(r.json()["records"]))
+        time.sleep(2)  # skån API'et mellem de to kald
     dele = [d for d in dele if len(d)]
     if not dele:
         sys.exit("Kunne ikke hente tariffer fra Energi Data Service (DatahubPricelist).")
