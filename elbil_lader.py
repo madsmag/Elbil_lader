@@ -6,6 +6,9 @@ Installer:   pip install pandas numpy requests lightgbm
 Eksempel:    python elbil_lader.py --behov "2026-11-23 07:00=25" --behov "2026-11-25 07:00=30"
              (--behov "klar-tidspunkt=kWh der skal tilføjes inden da", kan gentages)
 Flag:        --effekt 11   --refresh (hent data igen)   --backtest (vis modelkvalitet)
+             --sammenlign (backtest med forskellige vægtninger af nyere data)
+             --halvering 180 (halveringstid i dage for datavægt, 0 = fra)
+             --ingen-kalibrering (slå justering af intervallerne fra)
 
 Datakilder (gratis, ingen nøgle):
   - Priser:  Energi Data Service (Energinet)
@@ -34,6 +37,8 @@ TZ = "Europe/Copenhagen"
 HISTORIK_DAGE = 730          # træningsdata
 HORISONT_DAGE = 4            # hvor langt frem vi planlægger
 MIN_BESPARELSE_KR = 5.0      # under dette anbefales bare at lade straks
+HALVERING_DAGE = 180         # nyere data vægtes højere; data halveres i vægt pr. X dage (0 = fra)
+KALIBRERING_DAGE = 30        # de seneste dage bruges til at justere bias og intervaller
 CACHE = Path("cache")
 CACHE.mkdir(exist_ok=True)
 
@@ -152,7 +157,10 @@ def lav_features(df):
     X["time"] = lokal.hour
     X["ugedag"] = lokal.dayofweek
     X["maaned"] = lokal.month
-    X["dag_aar"] = lokal.dayofyear
+    # Glat årstid (i stedet for dag på året, som kan få modellen til at "huske" bestemte datoer)
+    vinkel = 2 * np.pi * (lokal.dayofyear.to_numpy() - 1) / 365.25
+    X["aar_sin"] = np.sin(vinkel)
+    X["aar_cos"] = np.cos(vinkel)
     X["temp"] = df["temp"]
     X["vind"] = df["vind"]
     X["sol"] = df["sol"]
@@ -165,7 +173,15 @@ def lav_features(df):
     return df, X
 
 
-def traen(Xtr, ytr):
+def vaegte(index, halvering):
+    """Vægt pr. træningsrække: nyere data tæller mere. None = ens vægt."""
+    if halvering <= 0:
+        return None
+    alder_dage = np.asarray((index.max() - index) / pd.Timedelta(days=1), dtype=float)
+    return 0.5 ** (alder_dage / halvering)
+
+
+def traen(Xtr, ytr, vaegt=None):
     modeller = {}
     for navn, alpha in (("lav", 0.2), ("median", 0.5), ("hoej", 0.8)):
         m = lgb.LGBMRegressor(
@@ -173,7 +189,7 @@ def traen(Xtr, ytr):
             num_leaves=31, min_child_samples=30, subsample=0.8, subsample_freq=1,
             colsample_bytree=0.8, verbose=-1,
         )
-        m.fit(Xtr, ytr)
+        m.fit(Xtr, ytr, sample_weight=vaegt)
         modeller[navn] = m
     return modeller
 
@@ -184,23 +200,96 @@ def forudsig(modeller, X):
     return pd.DataFrame(P, index=X.index, columns=["lav", "median", "hoej"])
 
 
-def backtest(df, X, dage=60):
+def kalibrering(modeller, Xcal, ycal):
+    """Måler bias og interval-fejl på nyere data, som modellen ikke er trænet på.
+    Returnerer korrektioner (kr/kWh), der lægges på prognoserne bagefter."""
+    ycal = np.asarray(ycal, dtype=float)
+    p = forudsig(modeller, Xcal)
+    bias = float(np.median(ycal - p["median"].to_numpy()))
+    p = p + bias
+    n = len(ycal)
+    niveau = min(1.0, 0.8 * (1 + 1 / n))
+    # Hver side af intervallet må ramme ved siden af 20 % af gangene (20-80 %-interval)
+    q_lav = float(np.quantile(p["lav"].to_numpy() - ycal, niveau))
+    q_hoej = float(np.quantile(ycal - p["hoej"].to_numpy(), niveau))
+    return {"bias": bias, "q_lav": q_lav, "q_hoej": q_hoej}
+
+
+def anvend_kalibrering(p, k):
+    out = p + k["bias"]
+    out["lav"] = np.minimum(out["lav"] - k["q_lav"], out["median"])
+    out["hoej"] = np.maximum(out["hoej"] + k["q_hoej"], out["median"])
+    return out
+
+
+def maal(p, yt):
+    yt = np.asarray(yt, dtype=float)
+    lav, med, hoej = (p[c].to_numpy() for c in ("lav", "median", "hoej"))
+    return {
+        "mae": float(np.mean(np.abs(med - yt))),
+        "bias": float(np.mean(med - yt)),
+        "daekning": float(np.mean((yt >= lav) & (yt <= hoej))),
+        "under": float(np.mean(yt < lav)),
+        "over": float(np.mean(yt > hoej)),
+    }
+
+
+def koer_backtest(df, X, dage, halvering, kalibrer):
+    """Træner på alt før testperioden, kalibrerer på KALIBRERING_DAGE dage lige før den,
+    og tester på de seneste `dage` dage. Returnerer målinger og prognoser."""
     y = df["pris"]
-    kendt = y.dropna().index
-    cut = kendt.max() - pd.Timedelta(days=dage)
-    tr = X[(y.notna()) & (X.index < cut)]
-    te = X[(y.notna()) & (X.index >= cut)]
-    modeller = traen(tr, y.loc[tr.index])
-    pr = forudsig(modeller, te)
-    yt = y.loc[te.index]
-    mae_model = (pr["median"] - yt).abs().mean()
-    base = te["pris_lag168"]
-    mae_base = (base - yt).abs()[base.notna()].mean()
-    daekning = ((yt >= pr["lav"]) & (yt <= pr["hoej"])).mean()
-    print(f"\nBacktest (sidste {dage} dage):")
-    print(f"  MAE model:    {mae_model:.3f} kr/kWh")
-    print(f"  MAE baseline: {mae_base:.3f} kr/kWh (samme time sidste uge)")
-    print(f"  Faktisk pris i 20-80%-intervallet: {daekning:.0%} (ideelt ca. 60%)")
+    kendt = y.notna()
+    cut = y.dropna().index.max() - pd.Timedelta(days=dage)
+    calstart = cut - pd.Timedelta(days=KALIBRERING_DAGE)
+    tr = kendt & (X.index < calstart)
+    cal = kendt & (X.index >= calstart) & (X.index < cut)
+    te = kendt & (X.index >= cut)
+    ald = tr | cal
+
+    k = None
+    if kalibrer:
+        m1 = traen(X[tr], y[tr], vaegte(X.index[tr.to_numpy()], halvering))
+        k = kalibrering(m1, X[cal], y[cal])
+    # Som i den rigtige kørsel: endelig model trænes på alle data før testperioden
+    m2 = traen(X[ald], y[ald], vaegte(X.index[ald.to_numpy()], halvering))
+    raa = forudsig(m2, X[te])
+    kal = anvend_kalibrering(raa, k) if k else None
+    yt = y[te]
+    base = X.loc[te, "pris_lag168"]
+    ok = base.notna().to_numpy()
+    mae_base = float(np.mean(np.abs(base.to_numpy()[ok] - yt.to_numpy()[ok])))
+    return {"raa": maal(raa, yt), "kal": maal(kal, yt) if k else None,
+            "mae_base": mae_base, "korr": k, "kal_p": kal if k else raa, "yt": yt}
+
+
+def backtest(df, X, dage=60, halvering=HALVERING_DAGE, kalibrer=True):
+    r = koer_backtest(df, X, dage, halvering, kalibrer)
+
+    def linje(navn, m):
+        print(f"  {navn:<14} MAE {m['mae']:.3f} | bias {m['bias']:+.3f} | "
+              f"dækning {m['daekning']:.0%} | pris under interval {m['under']:.0%}, over {m['over']:.0%}")
+
+    print(f"\nBacktest (sidste {dage} dage, datavægt-halvering {halvering} dage):")
+    print(f"  MAE baseline:  {r['mae_base']:.3f} kr/kWh (samme time sidste uge)")
+    linje("Uden kalibrering", r["raa"])
+    if r["kal"]:
+        linje("Kalibreret", r["kal"])
+        k = r["korr"]
+        print(f"  Korrektion fundet: bias {k['bias']:+.3f}, nedre {k['q_lav']:+.3f}, øvre {k['q_hoej']:+.3f} kr/kWh")
+    print("  Ideel dækning er ca. 60 %, og 'under' og 'over' bør hver ligge omkring 20 %.")
+    ugentlig = ((r["yt"] >= r["kal_p"]["lav"]) & (r["yt"] <= r["kal_p"]["hoej"])).astype(float)
+    ugentlig = ugentlig.resample("W").mean()
+    print("  Dækning pr. uge: " + ", ".join(f"{v:.0%}" for v in ugentlig.to_numpy()))
+
+
+def sammenlign(df, X, dage=60):
+    print(f"\nSammenligning af datavægt (backtest sidste {dage} dage, kalibreret):")
+    print(f"  {'Halvering':<12}{'MAE':>8}{'Bias':>9}{'Dækn. uden':>12}{'Dækn. med':>11}")
+    for h in (0, 90, 180, 365):
+        r = koer_backtest(df, X, dage, h, True)
+        navn = "ingen" if h == 0 else f"{h} dage"
+        print(f"  {navn:<12}{r['kal']['mae']:>8.3f}{r['kal']['bias']:>+9.3f}"
+              f"{r['raa']['daekning']:>12.0%}{r['kal']['daekning']:>11.0%}")
 
 
 # ----------------------------------------------------------------------------
@@ -247,6 +336,11 @@ def main():
     ap.add_argument("--effekt", type=float, default=11.0)
     ap.add_argument("--refresh", action="store_true")
     ap.add_argument("--backtest", action="store_true")
+    ap.add_argument("--sammenlign", action="store_true",
+                    help="backtest med forskellige vægtninger af nyere data")
+    ap.add_argument("--halvering", type=float, default=HALVERING_DAGE,
+                    help="halveringstid i dage for datavægt (0 = ens vægt)")
+    ap.add_argument("--ingen-kalibrering", action="store_true")
     a = ap.parse_args()
 
     behov = []
@@ -261,18 +355,31 @@ def main():
     df = vejr.join(priser.rename("pris"), how="outer")
     df, X = lav_features(df)
 
+    kalibrer = not a.ingen_kalibrering
+    if a.sammenlign:
+        sammenlign(df, X)
     if a.backtest:
-        backtest(df, X)
+        backtest(df, X, halvering=a.halvering, kalibrer=kalibrer)
 
     y = df["pris"]
-    tr = X[y.notna()]
-    modeller = traen(tr, y.loc[tr.index])
+    kendt_y = y.notna()
+    korr = None
+    if kalibrer:
+        # Find bias og intervalkorrektion på de seneste dage (modellen er ikke trænet på dem)
+        calstart = y.dropna().index.max() - pd.Timedelta(days=KALIBRERING_DAGE)
+        tr1 = kendt_y & (X.index < calstart)
+        cal = kendt_y & (X.index >= calstart)
+        m1 = traen(X[tr1], y[tr1], vaegte(X.index[tr1.to_numpy()], a.halvering))
+        korr = kalibrering(m1, X[cal], y[cal])
+    modeller = traen(X[kendt_y], y[kendt_y], vaegte(X.index[kendt_y.to_numpy()], a.halvering))
 
     nu = pd.Timestamp.now(tz="UTC")
     start = nu.ceil("h")
     slut = min(start + pd.Timedelta(days=HORISONT_DAGE), df.index.max())
     fremtid = X[(X.index >= start) & (X.index <= slut)]
     pred = forudsig(modeller, fremtid)
+    if korr:
+        pred = anvend_kalibrering(pred, korr)
     pred["kilde"] = "forudsagt"
     kendt = y.reindex(pred.index)
     er_kendt = kendt.notna()
