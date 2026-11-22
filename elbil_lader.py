@@ -159,7 +159,7 @@ PRISKOL = [f"Price{i}" for i in range(1, 25)]
 TARIF_KOL = ["ChargeOwner", "GLN_Number", "ChargeType", "ChargeTypeCode", "Note",
              "ValidFrom", "ValidTo"] + PRISKOL
 NOTE_C = r"tarif\s*c\b|\bc[- ]?(?:kunde|forbrug|tarif)"   # almindelig forbrugstarif for husholdninger
-NOTE_UDE = r"produc|produk|flex|egen|abo"                # springes over, medmindre --tarifkode bruges
+NOTE_UDE = r"produc|produk|flex|egen|abo|rabat|refusion|reduc"  # springes over, medmindre --tarifkode bruges
 
 
 def laes_tariffer(df):
@@ -254,7 +254,9 @@ def vaelg_nettarif_raekker(df, ejer, kode=None):
           & ~r["Note"].str.contains(NOTE_UDE, case=False, regex=True)]
     if c.empty:
         c = r[~r["Note"].str.contains(NOTE_UDE, case=False, regex=True)]
-    return c
+    # Rækker med kun 0 i priserne er typisk rabat-/dummyrækker, ikke den rigtige tarif
+    ikke_nul = c[c[PRISKOL].max(axis=1) > 0]
+    return ikke_nul if not ikke_nul.empty else c
 
 
 def pris_paa(raekker, lokal_naiv):
@@ -300,6 +302,9 @@ def lav_tillaeg(df, navn, idx_utc, kode, leverandoer):
     net, brugte = pris_paa(vaelg_nettarif_raekker(df, ejer, kode), lokal)
     if np.isnan(net).any():
         sys.exit(f"Fandt ikke nettarif for hele perioden hos {ejer}. Brug --vis-tariffer og --tarifkode.")
+    if net.max() < 0.05:
+        print(f"\nADVARSEL: nettariffen hos {ejer} er under 0,05 kr/kWh, hvilket ser forkert ud. "
+              "Kør med --vis-tariffer og vælg rigtig række med --tarifkode.\n")
     dele = {}
     for navn_, k in ENERGINET_KODER.items():
         e = df[df["ChargeTypeCode"] == k]
