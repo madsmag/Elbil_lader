@@ -9,6 +9,9 @@ Flag:        --effekt 11   --refresh (hent data igen)   --backtest (vis modelkva
              --sammenlign (backtest med forskellige vægtninger af nyere data)
              --halvering 180 (halveringstid i dage for datavægt, 0 = fra)
              --ingen-kalibrering (slå justering af intervallerne fra)
+Kroner:      --kroner-backtest (simulér dit ladebehov og se besparelsen i kroner)
+             --sim-kwh 25 --sim-klar 07:00 --sim-tid 22:00 --sim-dage 1,2,3 --backtest-dage 60
+             --min-besparelse 5 (kr, grænse for at anbefale at vente)
 Tariffer:    --netselskaber (liste)   --netselskab "radius" eller nummer   --vis-tariffer
              --tarifkode KODE (vælg en anden nettarif)   --tillaeg 0.05 (leverandør, kr/kWh ekskl. moms)
 
@@ -471,6 +474,89 @@ def sammenlign(df, X, dage=60):
               f"{r['raa']['daekning']:>12.0%}{r['kal']['daekning']:>11.0%}")
 
 
+def kroner_backtest(df, X, tillaeg_fn, dage, halvering, kalibrer, kwh, effekt, klar, beslut_tid,
+                    horisonter, min_bes):
+    """Simulerer et ladebehov hver dag og sammenligner i kroner: lad straks, følg modellens råd
+    og perfekt (kender facit). Modellen bruger kun priser, der var kendt på beslutningstidspunktet."""
+    y = df["pris"]
+    kendt = y.notna()
+    slut = y.dropna().index.max()
+    cut = slut - pd.Timedelta(days=dage)
+    calstart = cut - pd.Timedelta(days=KALIBRERING_DAGE)
+    tr = kendt & (X.index < calstart)
+    cal = kendt & (X.index >= calstart) & (X.index < cut)
+    ald = tr | cal
+    k = None
+    if kalibrer:
+        m1 = traen(X[tr], y[tr], vaegte(X.index[tr.to_numpy()], halvering))
+        k = kalibrering(m1, X[cal], y[cal])
+    m2 = traen(X[ald], y[ald], vaegte(X.index[ald.to_numpy()], halvering))
+    idx = X.index[(X.index >= cut) & (X.index <= slut)]
+    pred = forudsig(m2, X.loc[idx])
+    if k:
+        pred = anvend_kalibrering(pred, k)
+    tillaeg = tillaeg_fn(idx) if tillaeg_fn else None
+    pris_akt = samlet_pris(y.loc[idx], tillaeg)
+    pris_pred = samlet_pris(pred["median"], tillaeg)
+
+    th, tm = (int(v) for v in beslut_tid.split(":"))
+    kh, km = (int(v) for v in klar.split(":"))
+    cut_l = cut.tz_convert(TZ).tz_localize(None).normalize()
+    slut_l = slut.tz_convert(TZ).tz_localize(None).normalize()
+
+    def utc(naiv):
+        return naiv.tz_localize(TZ, ambiguous=True, nonexistent="shift_forward").tz_convert("UTC")
+
+    raekker = {h: [] for h in horisonter}
+    for d in pd.date_range(cut_l + pd.Timedelta(days=1), slut_l, freq="D"):
+        start = utc(d + pd.Timedelta(hours=th, minutes=tm)).ceil("h")
+        # Day-ahead-priser for næste døgn offentliggøres ca. kl. 13
+        kendt_til = utc(d + pd.Timedelta(days=2 if th >= 13 else 1))
+        for h in horisonter:
+            dl = utc(d + pd.Timedelta(days=h, hours=kh, minutes=km))
+            vindue = idx[(idx >= start) & (idx < dl)]
+            if start < cut or dl > slut + pd.Timedelta(hours=1) or len(vindue) * effekt < kwh:
+                continue
+            pa = pris_akt.loc[vindue]
+            if pa.isna().any():
+                continue
+            pm = pa.where(vindue < kendt_til, pris_pred.loc[vindue])  # kendt pris, ellers prognose
+            b = [(dl, kwh)]
+            straks = lav_plan(pm, start, b, effekt, "straks")
+            bedst = lav_plan(pm, start, b, effekt, "billigst")
+            facit = lav_plan(pa, start, b, effekt, "billigst")
+            forv = pris_for_plan(straks, pm) - pris_for_plan(bedst, pm)
+            venter = forv >= min_bes
+            raekker[h].append((pris_for_plan(straks, pa),
+                               pris_for_plan(bedst if venter else straks, pa),
+                               pris_for_plan(facit, pa), venter))
+
+    print(f"\nKroner-backtest: {kwh:g} kWh skal være klar kl. {klar}, beslutning kl. {beslut_tid}, "
+          f"hver dag de seneste {dage} dage.")
+    print(f"Anbefalingen følger planen kun, hvis forventet besparelse er mindst {min_bes:g} kr.")
+    print(f"{'Klar om':<10}{'Dage':>5}{'Straks':>9}{'Råd':>9}{'Perfekt':>9}{'Spar':>8}{'Af mulig':>10}"
+          f"{'Ventede':>9}{'Dyrere':>8}")
+    for h, rs in raekker.items():
+        navn = f"{h} dag" if h == 1 else f"{h} dage"
+        if not rs:
+            print(f"{navn:<10}{0:>5}  (ingen dage kunne simuleres)")
+            continue
+        tal = np.array([r[:3] for r in rs])
+        s, r_, p = tal.sum(axis=0)
+        mulig = s - p
+        andel = f"{(s - r_) / mulig:.0%}" if mulig > 1e-9 else "-"
+        venter = sum(r[3] for r in rs)
+        dyrere = int(np.sum(tal[:, 1] > tal[:, 0] + 1e-9))
+        print(f"{navn:<10}{len(rs):>5}{s:>9.0f}{r_:>9.0f}{p:>9.0f}{s - r_:>8.0f}{andel:>10}"
+              f"{venter:>9}{dyrere:>8}")
+    print("Kolonner: kr samlet over perioden. Straks = lad med det samme. Råd = følg modellen. "
+          "Perfekt = kender facit (øvre grænse).")
+    print("Spar = Straks - Råd. Af mulig = andel af den mulige besparelse, modellen fanger. "
+          "Ventede = dage hvor rådet var at vente. Dyrere = dage hvor rådet blev dyrere end straks.")
+    print("OBS: Testen bruger det faktiske vejr, ikke vejrprognoser, så den er lidt for optimistisk, "
+          "især for 2-3 dage frem.")
+
+
 # ----------------------------------------------------------------------------
 # LADEPLAN
 # ----------------------------------------------------------------------------
@@ -530,6 +616,16 @@ def main():
     ap.add_argument("--halvering", type=float, default=HALVERING_DAGE,
                     help="halveringstid i dage for datavægt (0 = ens vægt)")
     ap.add_argument("--ingen-kalibrering", action="store_true")
+    ap.add_argument("--min-besparelse", type=float, default=MIN_BESPARELSE_KR,
+                    help="mindste forventede besparelse (kr) før der anbefales at vente")
+    ap.add_argument("--backtest-dage", type=int, default=60, help="antal dage i backtest")
+    ap.add_argument("--kroner-backtest", action="store_true",
+                    help="simulér dit ladebehov hver dag og se besparelsen i kroner")
+    ap.add_argument("--sim-kwh", type=float, default=25.0, help="kWh der skal lades pr. behov")
+    ap.add_argument("--sim-klar", default="07:00", help="klar-tidspunkt, fx 07:00")
+    ap.add_argument("--sim-tid", default="22:00", help="tidspunkt du beslutter dig, fx 22:00")
+    ap.add_argument("--sim-dage", default="1,2,3",
+                    help="hvor mange dage frem klar-tidspunktet ligger, fx 1,2,3")
     a = ap.parse_args()
 
     if a.netselskaber or a.vis_tariffer:
@@ -543,11 +639,11 @@ def main():
                 ap.error("--vis-tariffer kræver --netselskab")
             vis_tariffer(tarif_df, a.netselskab)
         return
-    if not a.behov:
+    if not a.behov and not a.kroner_backtest:
         ap.error("--behov mangler (fx --behov \"2026-11-23 07:00=25\")")
 
     behov = []
-    for b in a.behov:
+    for b in (a.behov or []):
         tid, kwh = b.split("=")
         ts = pd.Timestamp(tid.strip()).tz_localize(TZ).tz_convert("UTC")
         behov.append((ts, float(kwh)))
@@ -560,9 +656,17 @@ def main():
 
     kalibrer = not a.ingen_kalibrering
     if a.sammenlign:
-        sammenlign(df, X)
+        sammenlign(df, X, dage=a.backtest_dage)
     if a.backtest:
-        backtest(df, X, halvering=a.halvering, kalibrer=kalibrer)
+        backtest(df, X, dage=a.backtest_dage, halvering=a.halvering, kalibrer=kalibrer)
+    if a.kroner_backtest:
+        tarif_df = hent_tariffer(a.refresh) if a.netselskab else None
+        fn = ((lambda idx: lav_tillaeg(tarif_df, a.netselskab, idx, a.tarifkode, a.tillaeg))
+              if a.netselskab else None)
+        kroner_backtest(df, X, fn, a.backtest_dage, a.halvering, kalibrer, a.sim_kwh, a.effekt,
+                        a.sim_klar, a.sim_tid, [int(v) for v in a.sim_dage.split(",")], a.min_besparelse)
+        if not behov:
+            return
 
     y = df["pris"]
     kendt_y = y.notna()
@@ -616,10 +720,14 @@ def main():
     print(f"Forventet besparelse: {besparelse:.1f} kr (usikkerhed: {min(bes_lav, bes_hoej):.1f} til {max(bes_lav, bes_hoej):.1f} kr)")
 
     forste = plan_bedst[plan_bedst > 0].index.min()
-    if besparelse < MIN_BESPARELSE_KR or forste == start:
-        print("\nAnbefaling: LAD NU (ingen væsentlig gevinst ved at vente)."
-              if besparelse < MIN_BESPARELSE_KR else
-              "\nAnbefaling: START NU - planen starter allerede i denne time.")
+    forste_txt = forste.tz_convert(TZ).strftime("%a %d/%m kl. %H:%M")
+    if forste == start:
+        print("\nAnbefaling: START NU - planen starter allerede i næste hele time.")
+    elif besparelse < 0.5:
+        print("\nAnbefaling: LAD NU (ingen gevinst ved at vente).")
+    elif besparelse < a.min_besparelse:
+        print(f"\nAnbefaling: MARGINAL GEVINST. Du kan spare ca. {besparelse:.1f} kr ved at starte "
+              f"{forste_txt}, hvis du kan bruge en timer. Ellers: lad nu.")
     else:
         print(f"\nAnbefaling: VENT. Første ladetime er {forste.tz_convert(TZ).strftime('%a %d/%m kl. %H:%M')}.")
 
