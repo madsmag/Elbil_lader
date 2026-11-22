@@ -9,6 +9,8 @@ Flag:        --effekt 11   --refresh (hent data igen)   --backtest (vis modelkva
              --sammenlign (backtest med forskellige vægtninger af nyere data)
              --halvering 180 (halveringstid i dage for datavægt, 0 = fra)
              --ingen-kalibrering (slå justering af intervallerne fra)
+Tariffer:    --netselskaber (liste)   --netselskab "radius" eller nummer   --vis-tariffer
+             --tarifkode KODE (vælg en anden nettarif)   --tillaeg 0.05 (leverandør, kr/kWh ekskl. moms)
 
 Datakilder (gratis, ingen nøgle):
   - Priser:  Energi Data Service (Energinet)
@@ -16,6 +18,7 @@ Datakilder (gratis, ingen nøgle):
 """
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -144,6 +147,159 @@ def hent_vejr(refresh):
     v = v.rename(columns={"temperature_2m": "temp", "wind_speed_100m": "vind", "shortwave_radiation": "sol"})
     v.to_csv(fil)
     return v
+
+
+# ----------------------------------------------------------------------------
+# TARIFFER: netselskab, Energinet og elafgift fra Energi Data Service (DatahubPricelist)
+# ----------------------------------------------------------------------------
+ENERGINET_GLN = "5790000432752"
+ENERGINET_KODER = {"systemtarif": "41000", "nettarif (Energinet)": "40000", "elafgift": "EA-001"}
+# Reserveværdier (kr/kWh ekskl. moms, 2026-satser), hvis satserne ikke kan hentes
+RESERVE = {"systemtarif": 0.072, "nettarif (Energinet)": 0.043, "elafgift": 0.008}
+PRISKOL = [f"Price{i}" for i in range(1, 25)]
+TARIF_KOL = ["ChargeOwner", "GLN_Number", "ChargeType", "ChargeTypeCode", "Note",
+             "ValidFrom", "ValidTo"] + PRISKOL
+NOTE_C = r"tarif\s*c\b|\bc[- ]?(?:kunde|forbrug|tarif)"   # almindelig forbrugstarif for husholdninger
+NOTE_UDE = r"produc|produk|flex|egen|abo"                # springes over, medmindre --tarifkode bruges
+
+
+def laes_tariffer(df):
+    df = df.copy()
+    df["ChargeTypeCode"] = df["ChargeTypeCode"].astype(str)
+    df["GLN_Number"] = df["GLN_Number"].astype(str)
+    df["Note"] = df["Note"].fillna("").astype(str)
+    for c in PRISKOL:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["fra"] = pd.to_datetime(df["ValidFrom"], errors="coerce")
+    df["til"] = pd.to_datetime(df["ValidTo"], errors="coerce").fillna(pd.Timestamp("2100-01-01"))
+    return df.dropna(subset=["fra"])
+
+
+def hent_tariffer(refresh):
+    fil = CACHE / "tariffer.csv"
+    if frisk(fil, refresh, 12):
+        return laes_tariffer(pd.read_csv(fil, dtype=str))
+    idag = pd.Timestamp.now(tz=TZ).normalize().tz_localize(None)
+    start = (idag - pd.Timedelta(days=4 * 365)).strftime("%Y-%m-%d")
+    slut = (idag + pd.Timedelta(days=200)).strftime("%Y-%m-%d")
+    dele = []
+    for filt in ({"ChargeType": ["D03"]}, {"ChargeTypeCode": list(ENERGINET_KODER.values())}):
+        params = {"start": start, "end": slut, "filter": json.dumps(filt),
+                  "columns": ",".join(TARIF_KOL), "limit": 0}
+        r = requests.get("https://api.energidataservice.dk/dataset/DatahubPricelist",
+                         params=params, timeout=180)
+        r.raise_for_status()
+        dele.append(pd.DataFrame(r.json()["records"]))
+    dele = [d for d in dele if len(d)]
+    if not dele:
+        sys.exit("Kunne ikke hente tariffer fra Energi Data Service (DatahubPricelist).")
+    df = pd.concat(dele).drop_duplicates()
+    df.to_csv(fil, index=False)
+    return laes_tariffer(df)
+
+
+def gyldige(df, lokal_naiv):
+    return df[(df["fra"] <= lokal_naiv) & (df["til"] > lokal_naiv)]
+
+
+def netselskaber(df):
+    nu = pd.Timestamp.now(tz=TZ).tz_localize(None)
+    g = gyldige(df, nu)
+    g = g[(g["ChargeType"] == "D03") & (g["GLN_Number"] != ENERGINET_GLN)
+          & g["ChargeOwner"].notna() & g["Price1"].notna()]
+    return sorted(g["ChargeOwner"].unique())
+
+
+def find_netselskab(df, navn):
+    liste = netselskaber(df)
+    if navn.strip().isdigit():
+        i = int(navn) - 1
+        if 0 <= i < len(liste):
+            return liste[i]
+        sys.exit(f"Nummer {navn} findes ikke. Kør med --netselskaber for at se listen.")
+    fund = [n for n in liste if navn.lower() in n.lower()]
+    exact = [n for n in liste if n.lower() == navn.lower()]
+    if len(exact) == 1:
+        return exact[0]
+    if len(fund) == 1:
+        return fund[0]
+    if not fund:
+        sys.exit(f"Intet netselskab matcher '{navn}'. Kør med --netselskaber for at se listen.")
+    sys.exit("Flere netselskaber matcher: " + "; ".join(fund) + ". Skriv navnet mere præcist.")
+
+
+def vaelg_nettarif_raekker(df, ejer, kode=None):
+    r = df[(df["ChargeOwner"] == ejer) & (df["ChargeType"] == "D03")]
+    if kode:
+        return r[r["ChargeTypeCode"] == str(kode)]
+    c = r[r["Note"].str.contains(NOTE_C, case=False, regex=True)
+          & ~r["Note"].str.contains(NOTE_UDE, case=False, regex=True)]
+    if c.empty:
+        c = r[~r["Note"].str.contains(NOTE_UDE, case=False, regex=True)]
+    return c
+
+
+def pris_paa(raekker, lokal_naiv):
+    """Pris (kr/kWh) for hver lokal time. PriceN gælder lokal time N-1; en dagspris fylder alle timer."""
+    ud = np.full(len(lokal_naiv), np.nan)
+    brugte = set()
+    for i, ts in enumerate(lokal_naiv):
+        g = gyldige(raekker, ts)
+        if g.empty:
+            continue
+        g = g.assign(_tim=g["Price24"].notna().astype(int)).sort_values(
+            ["_tim", "fra", "ChargeTypeCode"], ascending=[False, False, True])
+        r = g.iloc[0]
+        p = r[f"Price{ts.hour + 1}"]
+        if pd.isna(p):
+            p = r["Price1"]
+        ud[i] = p
+        brugte.add((r["ChargeTypeCode"], r["Note"]))
+    return ud, brugte
+
+
+def vis_tariffer(df, navn):
+    ejer = find_netselskab(df, navn)
+    nu = pd.Timestamp.now(tz=TZ).tz_localize(None)
+    g = gyldige(df[(df["ChargeOwner"] == ejer) & (df["ChargeType"] == "D03")], nu)
+    print(f"\nTariffer for {ejer} (gyldige nu, kr/kWh ekskl. moms):")
+    print(f"{'Kode':<10}{'Beskrivelse':<38}{'Laveste':>9}{'Højeste':>9}")
+    valgt = vaelg_nettarif_raekker(df, ejer)
+    valgte = set(valgt["ChargeTypeCode"])
+    for _, r in g.sort_values("ChargeTypeCode").iterrows():
+        p = r[PRISKOL].dropna()
+        if p.empty:
+            continue
+        mark = "  <- bruges som standard" if r["ChargeTypeCode"] in valgte else ""
+        print(f"{r['ChargeTypeCode']:<10}{r['Note'][:36]:<38}{p.min():>9.3f}{p.max():>9.3f}{mark}")
+    print("\nTjek mod din faktura. Vælg en anden med --tarifkode KODE.")
+
+
+def lav_tillaeg(df, navn, idx_utc, kode, leverandoer):
+    """Samlet tillæg til spotprisen (kr/kWh ekskl. moms) for hver time: nettarif + Energinet + afgift + leverandør."""
+    ejer = find_netselskab(df, navn)
+    lokal = idx_utc.tz_convert(TZ).tz_localize(None)
+    net, brugte = pris_paa(vaelg_nettarif_raekker(df, ejer, kode), lokal)
+    if np.isnan(net).any():
+        sys.exit(f"Fandt ikke nettarif for hele perioden hos {ejer}. Brug --vis-tariffer og --tarifkode.")
+    dele = {}
+    for navn_, k in ENERGINET_KODER.items():
+        e = df[df["ChargeTypeCode"] == k]
+        if (e["GLN_Number"] == ENERGINET_GLN).any():
+            e = e[e["GLN_Number"] == ENERGINET_GLN]
+        v = pris_paa(e, lokal)[0] if len(e) else np.full(len(lokal), np.nan)
+        if np.isnan(v).any():
+            print(f"Advarsel: kunne ikke finde {navn_} i data, bruger reserveværdi {RESERVE[navn_]:.3f} kr/kWh.")
+            v = np.where(np.isnan(v), RESERVE[navn_], v)
+        dele[navn_] = v
+    print(f"\nTariffer (kr/kWh ekskl. moms) for {ejer}:")
+    for kd, note in sorted(brugte):
+        print(f"  Nettarif, kode {kd} '{note}': {net.min():.3f} - {net.max():.3f}")
+    for navn_, v in dele.items():
+        print(f"  {navn_}: {v.mean():.3f}")
+    print(f"  Leverandørtillæg: {leverandoer:.3f}" + ("  (sæt med --tillaeg)" if leverandoer == 0 else ""))
+    total = net + sum(dele.values()) + leverandoer
+    return pd.Series(total, index=idx_utc)
 
 
 # ----------------------------------------------------------------------------
@@ -295,7 +451,9 @@ def sammenlign(df, X, dage=60):
 # ----------------------------------------------------------------------------
 # LADEPLAN
 # ----------------------------------------------------------------------------
-def samlet_pris(spot):
+def samlet_pris(spot, tillaeg=None):
+    if tillaeg is not None:  # rigtige tariffer fra Energi Data Service
+        return (spot + tillaeg.reindex(spot.index)) * MOMS
     timer = spot.index.tz_convert(TZ).hour
     tarif = np.array([TARIF_PR_TIME[h] for h in timer])
     return (spot + tarif + EKSTRA_PR_KWH) * MOMS
@@ -331,8 +489,16 @@ def pris_for_plan(brugt, pris):
 # ----------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--behov", action="append", required=True,
+    ap.add_argument("--behov", action="append",
                     help='"YYYY-MM-DD HH:MM=kWh", fx "2026-11-23 07:00=25". Kan gentages.')
+    ap.add_argument("--netselskaber", action="store_true",
+                    help="vis liste over netselskaber (og afslut)")
+    ap.add_argument("--netselskab", help="navn (eller del af navn) eller nummer fra listen")
+    ap.add_argument("--vis-tariffer", action="store_true",
+                    help="vis netselskabets tariffer til kontrol (kræver --netselskab)")
+    ap.add_argument("--tarifkode", help="vælg en bestemt nettarif-kode (se --vis-tariffer)")
+    ap.add_argument("--tillaeg", type=float, default=0.0,
+                    help="leverandørens tillæg i kr/kWh ekskl. moms (default 0)")
     ap.add_argument("--effekt", type=float, default=11.0)
     ap.add_argument("--refresh", action="store_true")
     ap.add_argument("--backtest", action="store_true")
@@ -342,6 +508,20 @@ def main():
                     help="halveringstid i dage for datavægt (0 = ens vægt)")
     ap.add_argument("--ingen-kalibrering", action="store_true")
     a = ap.parse_args()
+
+    if a.netselskaber or a.vis_tariffer:
+        tarif_df = hent_tariffer(a.refresh)
+        if a.netselskaber:
+            print("\nNetselskaber (brug navn eller nummer med --netselskab):")
+            for i, n in enumerate(netselskaber(tarif_df), 1):
+                print(f"  {i:>2}. {n}")
+        if a.vis_tariffer:
+            if not a.netselskab:
+                ap.error("--vis-tariffer kræver --netselskab")
+            vis_tariffer(tarif_df, a.netselskab)
+        return
+    if not a.behov:
+        ap.error("--behov mangler (fx --behov \"2026-11-23 07:00=25\")")
 
     behov = []
     for b in a.behov:
@@ -390,7 +570,10 @@ def main():
     if max(d for d, _ in behov) > pred.index.max() + pd.Timedelta(hours=1):
         sys.exit(f"Et klar-tidspunkt ligger uden for {HORISONT_DAGE}-dages prognosen.")
 
-    tot = {k: samlet_pris(pred[k]) for k in ("lav", "median", "hoej")}
+    tillaeg = None
+    if a.netselskab:
+        tillaeg = lav_tillaeg(hent_tariffer(a.refresh), a.netselskab, pred.index, a.tarifkode, a.tillaeg)
+    tot = {k: samlet_pris(pred[k], tillaeg) for k in ("lav", "median", "hoej")}
     plan_straks = lav_plan(tot["median"], start, behov, a.effekt, "straks")
     plan_bedst = lav_plan(tot["median"], start, behov, a.effekt, "billigst")
 
@@ -422,7 +605,10 @@ def main():
     for ts in plan_bedst[plan_bedst > 0].index:
         print(f"{ts.tz_convert(TZ).strftime('%a %d/%m %H:%M'):<16}{plan_bedst[ts]:>6.1f}"
               f"{tot['median'][ts]:>9.2f}  {pred.loc[ts, 'kilde']}")
-    print("\nHusk: tariffer/afgifter i scriptet er PLACEHOLDERS - tilpas dem øverst i filen.")
+    if tillaeg is None:
+        print("\nHusk: tariffer/afgifter er PLACEHOLDERS. Vælg dit netselskab med --netselskaber / --netselskab.")
+    else:
+        print("\nTariffer er hentet fra Energi Data Service. Tjek dem mod din faktura med --vis-tariffer.")
 
 
 if __name__ == "__main__":
