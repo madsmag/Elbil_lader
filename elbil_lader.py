@@ -342,10 +342,10 @@ def lav_features(df):
     lokal = df.index.tz_convert(TZ)
     X = pd.DataFrame(index=df.index)
     X["time"] = lokal.hour
-    X["ugedag"] = lokal.dayofweek
+    X["ugedag"] = lokal.day_of_week
     X["maaned"] = lokal.month
     # Glat årstid (i stedet for dag på året, som kan få modellen til at "huske" bestemte datoer)
-    vinkel = 2 * np.pi * (lokal.dayofyear.to_numpy() - 1) / 365.25
+    vinkel = 2 * np.pi * (lokal.day_of_year.to_numpy() - 1) / 365.25
     X["aar_sin"] = np.sin(vinkel)
     X["aar_cos"] = np.cos(vinkel)
     X["temp"] = df["temp"]
