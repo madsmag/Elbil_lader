@@ -133,12 +133,12 @@ def hent_vejr(refresh):
     frames = []
     for lat, lon in PUNKTER:
         basis = {"latitude": lat, "longitude": lon, "hourly": VEJR_VAR, "timezone": "UTC", "wind_speed_unit": "ms"}
-        a = requests.get("https://archive-api.open-meteo.com/v1/archive",
-                         params={**basis, "start_date": start, "end_date": arkiv_slut}, timeout=90)
-        p = requests.get("https://api.open-meteo.com/v1/forecast",
-                         params={**basis, "past_days": 10, "forecast_days": 7}, timeout=90)
-        a.raise_for_status()
-        p.raise_for_status()
+        a = hent_med_genforsoeg("https://archive-api.open-meteo.com/v1/archive",
+                                {**basis, "start_date": start, "end_date": arkiv_slut},
+                                timeout=120, kilde="Open-Meteo")
+        p = hent_med_genforsoeg("https://api.open-meteo.com/v1/forecast",
+                                {**basis, "past_days": 10, "forecast_days": 7},
+                                timeout=120, kilde="Open-Meteo")
         dfs = []
         for r in (a, p):
             d = pd.DataFrame(r.json()["hourly"])
@@ -177,24 +177,29 @@ def laes_tariffer(df):
     return df.dropna(subset=["fra"])
 
 
-def hent_med_genforsoeg(url, params, forsoeg=6):
-    """GET med ventetid og nyt forsøg ved 429 (rate limit) og midlertidige serverfejl."""
+def hent_med_genforsoeg(url, params, forsoeg=6, timeout=180, kilde="Energi Data Service"):
+    """GET med ventetid og nyt forsøg ved 429, serverfejl, timeout og netværksfejl."""
+    sidste = ""
     for i in range(forsoeg):
-        r = requests.get(url, params=params, timeout=180)
-        if r.status_code not in (429, 500, 502, 503, 504):
-            r.raise_for_status()
-            return r
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            if r.status_code not in (429, 500, 502, 503, 504):
+                r.raise_for_status()
+                return r
+            sidste = f"svarede {r.status_code}"
+            try:
+                vent = float(r.headers.get("Retry-After", ""))
+            except ValueError:
+                vent = 10 * 2 ** i          # 10, 20, 40, 80, 160 sek.
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            sidste = f"fejlede ({type(e).__name__})"
+            vent = 10 * 2 ** i
         if i == forsoeg - 1:
             break
-        try:
-            vent = float(r.headers.get("Retry-After", ""))
-        except ValueError:
-            vent = 10 * 2 ** i          # 10, 20, 40, 80, 160 sek.
-        vent = min(max(vent, 5), 180)
-        print(f"Energi Data Service svarede {r.status_code}. Venter {vent:.0f} sek. og prøver igen "
-              f"({i + 1}/{forsoeg - 1}) ...")
+        vent = min(max(vent, 5), 120)
+        print(f"{kilde} {sidste}. Venter {vent:.0f} sek. og prøver igen ({i + 1}/{forsoeg - 1}) ...")
         time.sleep(vent)
-    sys.exit(f"Energi Data Service afviser stadig ({r.status_code}). Vent et par minutter og prøv igen.")
+    sys.exit(f"{kilde} {sidste} efter {forsoeg} forsøg. Prøv igen senere.")
 
 
 def hent_tariffer(refresh):
