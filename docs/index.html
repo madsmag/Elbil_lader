@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="da">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Elbil-lader</title>
+<meta name="description" content="Find de billigste timer at lade din elbil, 4 dage frem.">
+<meta name="theme-color" content="#0D1B19">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Elbil-lader">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div id="app">
+  <main id="view" aria-live="polite"><p class="loading">Henter priser ...</p></main>
+  <nav id="tabs" aria-label="Hovedmenu">
+    <a href="#/lad" data-tab="lad"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2 4 14h7l-1 8 9-12h-7z"/></svg>Lad</a>
+    <a href="#/priser" data-tab="priser"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 21h18M4 16l5-6 4 3 7-9"/></svg>Priser</a>
+    <a href="#/besparelse" data-tab="besparelse"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m8 12.5 2.7 2.7L16 9.5"/></svg>Besparelse</a>
+  </nav>
+</div>
+<noscript><p style="padding:16px">Elbil-lader kræver JavaScript.</p></noscript>
+<script src="app.js"></script>
+</body>
+</html>

@@ -84,7 +84,7 @@ def eds_hent(datasaet, kolonner, start, slut):
 
 def hent_priser(refresh):
     """Timepriser i kr/kWh (spot, ekskl. afgifter/moms), UTC-indeks."""
-    fil = CACHE / "priser.csv"
+    fil = CACHE / f"priser_{OMRAADE}.csv"
     if frisk(fil, refresh, 3):
         s = pd.read_csv(fil, index_col=0, parse_dates=True)["pris"]
         s.index = pd.to_datetime(s.index, utc=True)
@@ -596,8 +596,109 @@ def pris_for_plan(brugt, pris):
 # ----------------------------------------------------------------------------
 # MAIN
 # ----------------------------------------------------------------------------
+EKSPORT_TIMER = 100   # timer frem fra nuværende hele time (4 dage + lidt luft)
+
+
+def energinet_vektor(df, lokal):
+    """Sum af Energinets systemtarif, nettarif og elafgift for hver time (kr/kWh ekskl. moms)."""
+    total = np.zeros(len(lokal))
+    for navn_, k in ENERGINET_KODER.items():
+        e = df[df["ChargeTypeCode"] == k]
+        if (e["GLN_Number"] == ENERGINET_GLN).any():
+            e = e[e["GLN_Number"] == ENERGINET_GLN]
+        v = pris_paa(e, lokal)[0] if len(e) else np.full(len(lokal), np.nan)
+        if np.isnan(v).any():
+            print(f"Advarsel: {navn_} mangler for nogle timer, bruger reserveværdi {RESERVE[navn_]:.3f}.")
+            v = np.where(np.isnan(v), RESERVE[navn_], v)
+        total += v
+    return total
+
+
+def afrund(arr, nd=4):
+    return [None if pd.isna(v) else round(float(v), nd) for v in arr]
+
+
+def byg_prognose(df, X, halvering, kalibrer, start, timer):
+    """Prognose pr. time fra `start` (UTC). Kendte priser erstatter prognosen."""
+    y = df["pris"]
+    kendt_y = y.notna()
+    korr = None
+    if kalibrer:
+        calstart = y.dropna().index.max() - pd.Timedelta(days=KALIBRERING_DAGE)
+        tr1 = kendt_y & (X.index < calstart)
+        cal = kendt_y & (X.index >= calstart)
+        m1 = traen(X[tr1], y[tr1], vaegte(X.index[tr1.to_numpy()], halvering))
+        korr = kalibrering(m1, X[cal], y[cal])
+    modeller = traen(X[kendt_y], y[kendt_y], vaegte(X.index[kendt_y.to_numpy()], halvering))
+    idx = pd.date_range(start, periods=timer, freq="h")
+    Xf = X.reindex(idx)
+    pred = forudsig(modeller, Xf)
+    if korr:
+        pred = anvend_kalibrering(pred, korr)
+    kendt = y.reindex(idx)
+    er = kendt.notna()
+    for k in ("lav", "median", "hoej"):
+        pred.loc[er, k] = kendt[er]
+    pred["kendt"] = er.astype(int)
+    return pred, korr, y
+
+
+def eksport(mappe, refresh, halvering, kalibrer):
+    """Skriver prognose.json og tariffer.json, som webappen læser."""
+    global OMRAADE
+    mappe = Path(mappe)
+    mappe.mkdir(parents=True, exist_ok=True)
+    nu = pd.Timestamp.now(tz="UTC")
+    start = nu.floor("h")
+    genereret = nu.strftime("%Y-%m-%dT%H:%M:%SZ")
+    fra = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    vejr = hent_vejr(refresh)
+    omraader = {}
+    for omr in ("DK1", "DK2"):
+        OMRAADE = omr
+        print(f"\n=== Prognose for {omr} ===")
+        priser = hent_priser(refresh)
+        df, X = lav_features(vejr.join(priser.rename("pris"), how="outer"))
+        pred, korr, y = byg_prognose(df, X, halvering, kalibrer, start, EKSPORT_TIMER)
+        hidx = pd.date_range(start - pd.Timedelta(days=21), start - pd.Timedelta(hours=1), freq="h")
+        hist = y.reindex(hidx)
+        omraader[omr] = {
+            "lav": afrund(pred["lav"]), "median": afrund(pred["median"]), "hoej": afrund(pred["hoej"]),
+            "kendt": [int(v) for v in pred["kendt"]],
+            "hist_fra": hidx[0].strftime("%Y-%m-%dT%H:%M:%SZ"), "hist": afrund(hist),
+            "kalibrering": {k: round(v, 4) for k, v in korr.items()} if korr else None,
+        }
+    prog = {"version": 1, "demo": False, "genereret": genereret, "fra": fra, "timer": EKSPORT_TIMER,
+            "enhed": "kr/kWh, spotpris uden tariffer, afgifter og moms", "omraader": omraader}
+    (mappe / "prognose.json").write_text(json.dumps(prog, separators=(",", ":")), encoding="utf-8")
+
+    print("\n=== Tariffer ===")
+    tdf = hent_tariffer(refresh)
+    idx = pd.date_range(start, periods=EKSPORT_TIMER, freq="h")
+    lokal = idx.tz_convert(TZ).tz_localize(None)
+    net, sprunget = [], []
+    for ejer in netselskaber(tdf):
+        rk = vaelg_nettarif_raekker(tdf, ejer, None)
+        v, brugte = pris_paa(rk, lokal) if len(rk) else (np.full(len(lokal), np.nan), set())
+        if np.isnan(v).any() or float(np.nanmax(v)) < 0.02:
+            sprunget.append(ejer)
+            continue
+        kode, note = sorted(brugte)[0] if brugte else ("", "")
+        net.append({"navn": ejer, "kode": kode, "note": note, "pris": afrund(v)})
+    if sprunget:
+        print("Sprunget over (ingen brugbar nettarif fundet): " + "; ".join(sprunget))
+    tar = {"version": 1, "demo": False, "genereret": genereret, "fra": fra, "timer": EKSPORT_TIMER,
+           "enhed": "kr/kWh ekskl. moms", "energinet": afrund(energinet_vektor(tdf, lokal)),
+           "netselskaber": net}
+    (mappe / "tariffer.json").write_text(json.dumps(tar, separators=(",", ":")), encoding="utf-8")
+    print(f"Skrev {len(net)} netselskaber og prognose for DK1 og DK2 til {mappe}/")
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--eksport", metavar="MAPPE",
+                    help="skriv prognose.json og tariffer.json (til webappen) og afslut")
     ap.add_argument("--behov", action="append",
                     help='"YYYY-MM-DD HH:MM=kWh", fx "2026-11-23 07:00=25". Kan gentages.')
     ap.add_argument("--netselskaber", action="store_true",
@@ -627,6 +728,10 @@ def main():
     ap.add_argument("--sim-dage", default="1,2,3",
                     help="hvor mange dage frem klar-tidspunktet ligger, fx 1,2,3")
     a = ap.parse_args()
+
+    if a.eksport:
+        eksport(a.eksport, a.refresh, a.halvering, not a.ingen_kalibrering)
+        return
 
     if a.netselskaber or a.vis_tariffer:
         tarif_df = hent_tariffer(a.refresh)
