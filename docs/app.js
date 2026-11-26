@@ -12,9 +12,12 @@ const store = {
   get(k, d) { try { const v = localStorage.getItem('el.' + k); return v ? JSON.parse(v) : d; } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem('el.' + k, JSON.stringify(v)); } catch (e) { /* privat tilstand */ } },
 };
-const DEF = { omraade: 'DK2', net: null, eff: 11, tillaeg: 0, moms: true, kwh: 40, dag: 1, tid: '07:00' };
+const dagUge = (kwh, away) => ({ kwh, away, fra: '07:00', til: '17:00' });
+const DEF = { omraade: 'DK2', net: null, eff: 11, tillaeg: 0, moms: true, bat: 60, soc: 50, socTs: 0, minP: 20, maxP: 80,
+  uge: [dagUge(12, true), dagUge(12, true), dagUge(12, true), dagUge(12, true), dagUge(12, true), dagUge(8, false), dagUge(8, false)] };
 const S = { prog: null, tar: null, D: null, err: null, route: 'lad', netFilter: '',
-  s: Object.assign({}, DEF, store.get('settings', {})), lad: store.get('ladninger', []) };
+  s: Object.assign({}, DEF, store.get('settings', {})), lad: store.get('ladninger', []).filter((x) => x.v === 2) };
+if (!Array.isArray(S.s.uge) || S.s.uge.length !== 7) S.s.uge = DEF.uge;
 const saveSettings = () => store.set('settings', S.s);
 const saveLad = () => store.set('ladninger', S.lad);
 
@@ -97,54 +100,93 @@ function prep() {
 const idxOf = (ms) => Math.floor((ms - S.D.t0) / H);
 
 /* ---------- ladeplan ---------- */
-function deadlineMs(off, tid) {
-  const n = lp(Date.now()), d = addDays(n.year, n.month, n.day, off), [h, m] = tid.split(':').map(Number);
-  return localToUtc(d.y, d.m, d.d, h, m);
-}
-function fill(order, kwh, eff) {
-  const m = new Map(); let rest = kwh;
-  for (const i of order) { if (rest <= 1e-9) break; const k = Math.min(eff, rest); m.set(i, k); rest -= k; }
-  return m;
-}
+const UGEDAGE = ['Mandag', 'Tirsdag', 'Onsdag', 'Torsdag', 'Fredag', 'Lørdag', 'Søndag'];
+const hmMin = (t) => { const [h, m] = String(t).split(':').map(Number); return h * 60 + (m || 0); };
+const sumMap = (m) => { let a = 0; m.forEach((k) => { a += k; }); return a; };
 const costOf = (m, arr) => { let c = 0; m.forEach((k, i) => { c += k * arr[i]; }); return c; };
+const dowOf = (ms) => { const p = lp(ms); return (new Date(Date.UTC(p.year, p.month - 1, p.day)).getUTCDay() + 6) % 7; };
+
+/* Ture og tidspunkter, hvor bilen er hjemme, ud fra ugeplanen. */
+function buildSchedule(startI) {
+  const D = S.D, uge = S.s.uge, ev = {}, away = new Set(), info = [];
+  for (let i = startI; i < D.N; i++) {
+    const ms = D.t0 + i * H, p = lp(ms), u = uge[dowOf(ms)], m = p.hour * 60, fra = hmMin(u.fra), til = hmMin(u.til);
+    if (u.away && fra < til) {
+      if (m < til && m + 60 > fra) away.add(i);
+      if (m <= fra && fra < m + 60 && u.kwh > 0) ev[i] = (ev[i] || 0) + u.kwh;
+    } else if (p.hour === 12 && u.kwh > 0) ev[i] = (ev[i] || 0) + u.kwh;
+  }
+  return { ev, away };
+}
+
+function nightLabel(ms) {
+  const n = lp(Date.now()), p = lp(ms), diff = Math.round((Date.UTC(p.year, p.month - 1, p.day) - Date.UTC(n.year, n.month - 1, n.day)) / 864e5);
+  if ((diff === 0 && p.hour >= 22) || (diff === 1 && p.hour < 6) || (diff === 0 && p.hour < 6)) return 'i nat';
+  const dn = dayName(ms);
+  return dn === 'I dag' ? 'i dag' : dn === 'I morgen' ? 'i morgen' : F.wdl.format(ms);
+}
+function runs(plan, startI, N) {
+  const out = []; let cur = null;
+  for (let i = startI; i < N; i++) {
+    const k = plan.get(i) || 0;
+    if (k > 1e-9) { if (cur && cur.to === i) { cur.to = i + 1; cur.kwh += k; } else { cur = { from: i, to: i + 1, kwh: k }; out.push(cur); } }
+  }
+  return out;
+}
 
 function planCalc() {
-  const D = S.D, s = S.s, now = Date.now();
-  const opts = [0, 1, 2, 3].map((off) => { const dl = deadlineMs(off, s.tid); return { off, dl, ok: dl > now + H && idxOf(dl) <= D.N }; });
-  const cur = opts.find((o) => o.off === s.dag && o.ok) || opts.find((o) => o.ok);
-  const P = { opts, cur };
-  if (!cur) { P.err = 'Klar-tidspunktet ligger uden for prognosen. Vælg et andet tidspunkt.'; return P; }
-  const startI = Math.max(0, Math.ceil((now - D.t0) / H)), endI = Math.min(D.N, Math.floor((cur.dl - D.t0) / H));
-  const win = []; for (let i = startI; i < endI; i++) win.push(i);
-  const kwh = s.kwh, eff = s.eff;
-  if (!win.length) { P.err = 'Der er ingen hele timer inden klar-tidspunktet.'; return P; }
-  if (win.length * eff < kwh - 1e-9) { P.err = kwh + ' kWh kan ikke nås med ' + nf(eff, 1) + ' kW inden da. Der er ' + win.length + ' timer, og det kræver ' + nf(kwh / eff, 1) + '.'; return P; }
-  const T = D.T;
-  const now_ = fill(win, kwh, eff);
-  const cheap = fill([...win].sort((a, b) => T.md[a] - T.md[b] || a - b), kwh, eff);
-  const cNow = costOf(now_, T.md), cBest = costOf(cheap, T.md), sav = cNow - cBest;
-  const s1 = costOf(now_, T.lo) - costOf(cheap, T.lo), s2 = costOf(now_, T.hi) - costOf(cheap, T.hi);
-  const chosen = [...cheap.keys()].sort((a, b) => a - b);
-  Object.assign(P, { startI, endI, win, now_, cheap, cNow, cBest, sav, lo: Math.min(s1, s2), hi: Math.max(s1, s2), chosen, first: chosen[0] });
-  const ms0 = D.t0 + P.first * H, hrs = nf(kwh / eff, 1);
-  const dn = dayName(ms0), early = Number(hh(ms0)) < 6;
-  const when = dn === 'I dag' ? 'i dag' : dn === 'I morgen' ? (early ? 'i nat' : 'i morgen') : F.wdl.format(ms0);
-  if (P.first === startI) {
-    P.verdict = 'Lad nu'; P.headline = 'Start ladningen nu';
-    P.text = kwh + ' kWh på ' + hrs + ' timer. Planen starter allerede i næste hele time.';
-  } else if (sav < 0.5) {
-    P.verdict = 'Lad nu'; P.headline = 'Start ladningen nu';
-    P.text = 'Der er ingen gevinst ved at vente. ' + kwh + ' kWh tager ' + hrs + ' timer.';
-  } else if (sav < MIN_BES) {
-    P.verdict = 'Marginal gevinst'; P.headline = 'Start ' + when + ' kl. ' + hh(ms0) + ':00';
-    P.text = 'Du sparer kun ca. ' + nf(sav, 1) + ' kr. Vent kun, hvis du kan bruge en timer på laderen.';
-  } else {
-    P.verdict = 'Vent med at lade'; P.headline = 'Start ' + when + ' kl. ' + hh(ms0) + ':00';
-    P.text = kwh + ' kWh på ' + hrs + ' timer. Ca. ' + kr0(sav) + ' kr billigere end at lade nu.';
+  const D = S.D, s = S.s, now = Date.now(), P = {};
+  const startI = Math.max(0, Math.ceil((now - D.t0) / H)), N = D.N;
+  if (N - startI < 8) { P.err = 'Prognosen rækker for kort frem. Prøv igen om lidt.'; return P; }
+  const bat = Math.max(10, s.bat), minK = bat * s.minP / 100, maxK = Math.max(minK, bat * s.maxP / 100);
+  const avg = s.uge.reduce((a, u) => a + u.kwh, 0) / 7;
+  const { ev, away } = buildSchedule(startI);
+  const cfg = { startI, N, price: D.T.md, eff: s.eff, bat, soc: Math.min(bat, bat * s.soc / 100), minK, maxK,
+    endK: Math.min(maxK, minK + avg), ev, avail: (i) => !away.has(i) };
+  const plan = Planner.optimize(cfg), base = Planner.rolling(cfg);
+  const simP = Planner.simulate(cfg, plan), simB = Planner.simulate(cfg, base), T = D.T;
+  const cP = costOf(plan, T.md), cB = costOf(base, T.md), sav = cB - cP;
+  const s1 = costOf(base, T.lo) - costOf(plan, T.lo), s2 = costOf(base, T.hi) - costOf(plan, T.hi);
+  const lim = startI + 24, in24 = (m) => { let a = 0; m.forEach((k, i) => { if (i < lim) a += k; }); return a; };
+  const p24 = in24(plan), b24 = in24(base), d24 = b24 - p24;
+  const rp = runs(plan, startI, N), first = rp[0];
+  Object.assign(P, { cfg, startI, N, ev, away, plan, base, simP, simB, cP, cB, sav, lo: Math.min(s1, s2), hi: Math.max(s1, s2),
+    p24, b24, runs: rp, first, kwhP: sumMap(plan), kwhB: sumMap(base), minK, maxK, bat });
+  P.known = [...plan.keys()].every((i) => D.kendt[i]);
+  const short = simP.short;
+  if (short.length) {
+    const x = short[0], ms = D.t0 + x.i * H;
+    P.verdict = 'Kan ikke nås'; P.headline = 'Mangler ca. ' + Math.ceil(short.reduce((a, q) => a + q.kwh, 0)) + ' kWh';
+    P.text = 'Selv med fuld ladning kan planen ikke dække turen ' + dayName(ms).toLowerCase() + ' kl. ' + hh(ms) + ':00. Tjek ladeeffekt, ladetider eller forbrug i ugeplanen.';
+    P.tip = 'Brug fuld ladning, så meget som muligt, indtil da.'; P.range = '';
+    return P;
   }
-  P.known = chosen.every((i) => D.kendt[i]);
+  const sess = (r) => nightLabel(D.t0 + r.from * H) + ' kl. ' + pad(Number(hh(D.t0 + r.from * H))) + '–' + pad(Number(hh(D.t0 + r.to * H)) % 24);
+  const pctAt = (i) => Math.round(simP.soc[i] / bat * 100);
+  const f24 = rp.filter((r) => r.from < lim);
+  if (sav < MIN_BES) {
+    P.verdict = 'Følg Clever';
+    P.headline = p24 < 0.5 ? 'Ingen ladning de næste 24 timer' : 'Lad som Clever planlægger';
+    P.text = 'Der er ingen reel gevinst ved at vente: planen sparer kun ca. ' + nf(sav, 1) + ' kr over de næste dage.';
+  } else if (d24 >= 1) {
+    P.verdict = 'Udskyd ladningen';
+    P.headline = p24 < 0.5 ? 'Lad ikke de næste 24 timer' : 'Lad kun ' + Math.round(p24) + ' kWh de næste 24 timer';
+    const later = rp.find((r) => r.from >= lim);
+    P.text = 'Clever vil lade ' + Math.round(b24) + ' kWh. Planen venter med resten' + (later ? ' til ' + sess(later) : '') + ', hvor strømmen er billigere. Du sparer ca. ' + kr0(sav) + ' kr over ' + Math.round((N - startI) / 24) + ' dage.';
+  } else if (d24 <= -1) {
+    P.verdict = 'Lad mere nu';
+    P.headline = 'Lad ' + Math.round(p24) + ' kWh de næste 24 timer';
+    P.text = 'Clever vil kun lade ' + Math.round(b24) + ' kWh. Det er billigere at lade mere nu end senere. Du sparer ca. ' + kr0(sav) + ' kr.';
+  } else {
+    P.verdict = 'Følg Clever';
+    P.headline = 'Lad ' + Math.round(p24) + ' kWh de næste 24 timer';
+    P.text = 'Dagens ladning er den samme som Clever vælger. Gevinsten ligger på de senere dage: ca. ' + kr0(sav) + ' kr.';
+  }
+  if (f24.length) {
+    P.text += ' Lad ' + f24.map(sess).join(' og ') + '.';
+    P.tip = 'Sæt ladegrænsen til ca. ' + pctAt(f24[f24.length - 1].to - 1) + ' %.';
+  }
   P.range = P.known ? 'Priserne er kendte, så besparelsen er sikker.' : kr0(P.lo) === kr0(P.hi) ? 'Besparelse ca. ' + kr0(P.lo) + ' kr, afhængigt af prognosen.' : 'Besparelse mellem ' + kr0(P.lo) + ' og ' + kr0(P.hi) + ' kr, afhængigt af prognosen.';
-  P.tip = P.first === startI || sav < 0.5 ? '' : 'Sæt bilens eller laderens timer til kl. ' + hh(ms0) + ':00.';
   return P;
 }
 
@@ -162,6 +204,38 @@ function banner() {
 }
 function head(title, right) { return '<div class="head"><div><div class="eyebrow">Elbil-lader · ' + esc(S.s.omraade) + '</div><h1>' + title + '</h1></div>' + (right || '') + '</div>'; }
 
+function socChart(P) {
+  const D = S.D, n = P.N - P.startI, W = 320, Hh = 110, x = (k) => (k / n * W).toFixed(1), y = (kwh) => (Hh - 6 - kwh / P.bat * (Hh - 12)).toFixed(1);
+  const line = (sim) => {
+    let d = 'M0 ' + y(sim.soc[P.startI] - 0), prev = P.cfg.soc;
+    d = 'M0 ' + y(prev);
+    for (let i = P.startI; i < P.N; i++) { const k = i - P.startI; d += ' L' + x(k + 1) + ' ' + y(sim.soc[i]); }
+    return d;
+  };
+  let bands = '';
+  for (let i = P.startI; i < P.N; i++) if (P.away.has(i)) bands += '<rect x="' + x(i - P.startI) + '" y="0" width="' + (W / n + 0.3).toFixed(1) + '" height="' + Hh + '" class="away"/>';
+  let seps = '', lab = '';
+  for (let i = P.startI + 1; i < P.N; i++) if (lp(D.t0 + i * H).hour === 0) seps += '<line x1="' + x(i - P.startI) + '" x2="' + x(i - P.startI) + '" y1="0" y2="' + Hh + '" class="dsep"/>';
+  return '<svg viewBox="0 0 ' + W + ' ' + Hh + '" class="soc" role="img" aria-label="Batteriniveau de næste dage. Planen er markeret, Clever-metoden er stiplet.">' + bands + seps +
+    '<line x1="0" x2="' + W + '" y1="' + y(P.minK) + '" y2="' + y(P.minK) + '" class="minl"/>' +
+    '<path d="' + line(P.simB) + '" class="lb"/><path d="' + line(P.simP) + '" class="lp"/></svg>';
+}
+
+function dayRows(P) {
+  const D = S.D, groups = new Map();
+  for (let i = P.startI; i < P.N; i++) { const k = dayKey(D.t0 + i * H); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(i); }
+  return [...groups.values()].map((g) => {
+    const ms0 = D.t0 + g[0] * H, u = S.s.uge[dowOf(ms0)];
+    const kp = g.reduce((a, i) => a + (P.plan.get(i) || 0), 0), kb = g.reduce((a, i) => a + (P.base.get(i) || 0), 0);
+    const rs = runs(P.plan, g[0], g[g.length - 1] + 1).map((r) => pad(Number(hh(D.t0 + r.from * H))) + '–' + pad(Number(hh(D.t0 + r.to * H)) % 24)).join(', ');
+    const use = u.away ? 'Væk ' + u.fra + '–' + u.til + ', ' + u.kwh + ' kWh' : 'Hjemme, ' + u.kwh + ' kWh';
+    const c = g.reduce((a, i) => a + (P.plan.get(i) || 0) * D.T.md[i], 0);
+    return '<div class="item"><div class="l"><b>' + esc(dayName(ms0)) + '</b><span class="small">' + esc(use) + '</span></div>' +
+      '<div class="r"><span class="big num">' + (kp > 0.05 ? nf(kp, kp % 1 ? 1 : 0) + ' kWh' : 'Ingen') + '</span><span class="small num">' +
+      (kp > 0.05 ? 'kl. ' + rs + ' · ' + kr0(c) + ' kr' : '') + (Math.abs(kb - kp) >= 0.5 ? (kp > 0.05 ? ' · ' : '') + 'Clever ' + nf(kb, kb % 1 ? 1 : 0) + ' kWh' : '') + '</span></div></div>';
+  }).join('');
+}
+
 function viewLad() {
   const D = S.D, s = S.s, P = planCalc(), now = Date.now();
   const when = cap(F.wdl.format(now)) + ' ' + F.dm.format(now) + ', ' + hmf(now);
@@ -170,37 +244,55 @@ function viewLad() {
     h += '<div class="errbox">' + esc(P.err) + '</div>';
   } else {
     h += '<section class="rec"><div class="verdict">' + P.verdict + '</div><div class="headline">' + esc(P.headline) + '</div>' +
-      '<div class="text">' + esc(P.text) + '</div><div class="range">' + esc(P.range) + '</div>' +
+      '<div class="text">' + esc(P.text) + '</div>' + (P.range ? '<div class="range">' + esc(P.range) + '</div>' : '') +
       (P.tip ? '<div class="text">' + esc(P.tip) + '</div>' : '') + '</section>';
-    h += '<div class="tiles"><div class="tile"><span class="label">Lad nu</span><b class="num">' + kr0(P.cNow) + ' kr</b></div>' +
-      '<div class="tile"><span class="label">Ladeplan</span><b class="num">' + kr0(P.cBest) + ' kr</b></div>' +
+    h += '<div class="tiles"><div class="tile"><span class="label">Clever-metode</span><b class="num">' + kr0(P.cB) + ' kr</b></div>' +
+      '<div class="tile"><span class="label">Ladeplan</span><b class="num">' + kr0(P.cP) + ' kr</b></div>' +
       '<div class="tile good"><span class="label">Du sparer</span><b class="num">' + kr0(P.sav) + ' kr</b></div></div>';
   }
-  const chips = P.opts.map((o) => {
-    const lbl = o.off === 0 ? 'I dag' : o.off === 1 ? 'I morgen' : wd(o.dl);
-    const on = P.cur && o.off === P.cur.off;
-    return '<button class="chip" data-act="dag" data-v="' + o.off + '" aria-pressed="' + on + '"' + (o.ok ? '' : ' disabled') + '>' + esc(cap(lbl)) + '</button>';
-  }).join('');
-  h += '<section class="card"><div class="row"><h2>Energi</h2><div class="stepper">' +
-    '<button data-act="kwh" data-v="-5" aria-label="Mindre">−</button><output class="num">' + s.kwh + ' kWh</output>' +
-    '<button data-act="kwh" data-v="5" aria-label="Mere">+</button></div></div>' +
-    '<div class="row"><label class="label" for="tid">Klar kl.</label><input id="tid" type="time" value="' + esc(s.tid) + '" data-in="tid"></div>' +
-    '<div class="chips" role="group" aria-label="Dag">' + chips + '</div></section>';
-  if (!P.err) {
-    const T = D.T.md, lo = Math.min(...P.win.map((i) => T[i])), hi = Math.max(...P.win.map((i) => T[i])), set = new Set(P.chosen);
-    const bars = P.win.map((i) => {
-      const pct = 14 + (hi > lo ? (T[i] - lo) / (hi - lo) : 0.5) * 86;
-      return '<i style="height:' + pct.toFixed(0) + '%;background:' + (set.has(i) ? 'var(--sel)' : 'var(--off)') + '"></i>';
+  const kwhNow = Math.round(s.bat * s.soc / 100);
+  const stale = s.socTs && now - s.socTs > 4 * H ? '<p class="warn">Niveauet er ' + Math.round((now - s.socTs) / H) + ' timer gammelt. Opdater det for en rigtig plan.</p>' : '';
+  h += '<section class="card"><div class="row"><h2>Batteri nu</h2><output class="num big-out" id="socout">' + s.soc + ' % · ' + kwhNow + ' kWh</output></div>' +
+    '<input type="range" min="0" max="100" step="1" value="' + s.soc + '" data-in="soc" aria-label="Batteriniveau i procent">' + stale +
+    '<div class="row"><span class="sub">Ladegrænse ' + s.maxP + ' %, reserve ' + s.minP + ' %, ' + s.bat + ' kWh</span><a class="link-btn" href="#/uge">Uge og ladetider</a></div></section>';
+  if (!P.err && !P.verdict.startsWith('Kan ikke')) {
+    const T = D.T.md, idx = []; for (let i = P.startI; i < P.N; i++) idx.push(i);
+    const lo = Math.min(...idx.map((i) => T[i])), hi = Math.max(...idx.map((i) => T[i]));
+    const bars = idx.map((i) => {
+      const pct = 14 + (hi > lo ? (T[i] - lo) / (hi - lo) : 0.5) * 86, on = P.plan.has(i), aw = P.away.has(i);
+      return '<i style="height:' + pct.toFixed(0) + '%;background:' + (on ? 'var(--sel)' : 'var(--off)') + ';opacity:' + (aw ? 0.3 : 1) + '"></i>';
     }).join('');
-    h += '<section class="card"><div class="row"><h2>Ladeplan</h2><span class="label">' + P.chosen.length + ' timer valgt</span></div>' +
-      '<div class="strip" role="img" aria-label="Pris pr. time frem til klar-tidspunktet, valgte timer er markeret">' + bars + '</div>' +
-      '<div class="axis"><span>' + esc(wd(D.t0 + P.startI * H)) + ' ' + hh(D.t0 + P.startI * H) + ':00</span><span>Klar ' + esc(wd(P.cur.dl)) + ' ' + hmf(P.cur.dl) + '</span></div></section>';
-    const saved = S.lad.some((x) => x.dl === P.cur.dl && x.kwh === s.kwh);
+    h += '<section class="card"><div class="row"><h2>Ladeplan</h2><span class="label">' + P.runs.length + (P.runs.length === 1 ? ' ladning' : ' ladninger') + ', ' + nf(P.kwhP, 0) + ' kWh</span></div>' +
+      '<div class="strip" role="img" aria-label="Pris pr. time, valgte timer er markeret, lyse søjler er tider hvor bilen er væk">' + bars + '</div>' +
+      '<div class="axis"><span>' + esc(wd(D.t0 + P.startI * H)) + ' ' + hh(D.t0 + P.startI * H) + ':00</span><span>' + esc(wd(D.t0 + (P.N - 1) * H)) + ' ' + hh(D.t0 + (P.N - 1) * H) + ':00</span></div>' +
+      '<div class="legend"><span><i style="background:var(--sel)"></i>Lad</span><span><i style="background:var(--off);opacity:.3"></i>Bilen er væk</span></div></section>' +
+      '<section class="card list" style="gap:0;padding-top:12px;padding-bottom:6px"><h2 style="padding-bottom:6px">Dag for dag</h2>' + dayRows(P) + '</section>' +
+      '<section class="card"><div class="row"><h2>Batteriniveau</h2><span class="legend" style="margin:0"><span><i style="background:var(--sel)"></i>Plan</span><span><i style="background:var(--mute)"></i>Clever</span></span></div>' + socChart(P) +
+      '<div class="axis"><span>' + esc(wd(D.t0 + P.startI * H)) + ' ' + hh(D.t0 + P.startI * H) + ':00</span><span>Stiplet gul: reserve ' + s.minP + ' %. Grå: bilen er væk</span></div></section>';
+    const saved = S.lad.some((x) => x.ts > now - H && x.kwh === Math.round(P.kwhP * 10) / 10);
     h += '<div style="margin-top:12px"><button class="btn" style="width:100%" data-act="gem"' + (saved ? ' disabled' : '') + '>' + (saved ? 'Gemt under Besparelse' : 'Jeg følger planen') + '</button></div>' +
       '<p class="hint">Priser ' + (s.moms ? 'inkl.' : 'ekskl.') + ' moms, afgifter og nettarif hos ' + esc(D.netObj.navn) + '.' +
-      (s.tillaeg ? '' : ' Tilføj dit leverandørtillæg under Indstillinger.') + '</p>';
+      (s.tillaeg ? '' : ' Tilføj dit leverandørtillæg under Indstillinger.') + ' Clever-metoden er en antagelse: billigste timer et døgn ad gangen.</p>';
   }
   return h;
+}
+
+function viewUge() {
+  const s = S.s;
+  const days = s.uge.map((u, d) => {
+    const t = (f, v) => '<input type="time" value="' + esc(v) + '" data-in="uge" data-day="' + d + '" data-f="' + f + '" aria-label="' + UGEDAGE[d] + (f === 'fra' ? ' kører' : ' hjemme igen') + '">';
+    return '<section class="card"><div class="row"><h2>' + UGEDAGE[d] + '</h2><div class="stepper"><button data-act="ukwh" data-v="' + d + ':-1" aria-label="Mindre">−</button>' +
+      '<output class="num">' + u.kwh + ' kWh</output><button data-act="ukwh" data-v="' + d + ':1" aria-label="Mere">+</button></div></div>' +
+      '<div class="row" style="min-height:44px"><div><div style="font-weight:500">Bilen er væk</div><div class="small label" style="font-weight:400">' + (u.away ? 'Der lades ikke i dette tidsrum' : 'Hjemme hele dagen, kan lade når som helst') + '</div></div>' +
+      '<button class="switch" role="switch" aria-checked="' + u.away + '" aria-label="' + UGEDAGE[d] + ' væk" data-act="away" data-v="' + d + '"></button></div>' +
+      (u.away ? '<div class="row"><span class="label">Kører kl.</span>' + t('fra', u.fra) + '<span class="label">Hjemme kl.</span>' + t('til', u.til) + '</div>' : '') + '</section>';
+  }).join('');
+  const num = (id, label, sub, val, min, max, step) => '<div class="row"><div><label for="' + id + '">' + label + '</label><div class="small label" style="font-weight:400">' + sub + '</div></div>' +
+    '<input id="' + id + '" type="number" inputmode="decimal" min="' + min + '" max="' + max + '" step="' + step + '" value="' + val + '" data-in="' + id + '"></div>';
+  return '<a class="back" href="#/lad">' + ICON.back + 'Tilbage</a><h1 style="padding:0 4px">Uge og ladetider</h1>' +
+    '<div class="sub" style="padding:0 4px">Forventet forbrug pr. dag og tidspunkter, hvor bilen ikke kan lade. Forbruget trækkes, når du kører hjemmefra.</div>' + banner() +
+    '<section class="card"><h2>Bil</h2>' + num('bat', 'Batteristørrelse (kWh)', 'Brugbar kapacitet', s.bat, 10, 200, 1) +
+    num('minP', 'Reserve (%)', 'Må helst ikke gå under', s.minP, 0, 90, 1) + num('maxP', 'Ladegrænse (%)', 'Lad ikke højere', s.maxP, 20, 100, 1) + '</section>' + days;
 }
 
 function pctile(arr, q) { const a = [...arr].sort((x, y) => x - y); return a[Math.min(a.length - 1, Math.floor(q * a.length))]; }
@@ -271,7 +363,7 @@ function spotAt(ms, area) {
   return null;
 }
 function evalItem(it) {
-  const D = S.D; let paid = 0, straks = 0, est = false;
+  const D = S.D; let paid = 0, straks = 0, est = false, kP = 0, kB = 0;
   const mom = it.moms ? MOMS : 1;
   const price = (ms) => {
     const sp = spotAt(ms, it.area); if (!sp) return null;
@@ -279,9 +371,15 @@ function evalItem(it) {
     const j = idxOf(ms), k = ((j % 24) + 24) % 24, ok = j >= 0 && j < D.N;
     return (sp.v + (ok ? D.net[j] : D.net[k]) + (ok ? D.fixed[j] : D.fixed[k]) + it.tillaeg) * mom;
   };
-  for (const [ms, k] of it.plan) { const p = price(ms); if (p == null) return null; paid += p * k; }
-  for (const [ms, k] of it.straks) { const p = price(ms); if (p == null) return null; straks += p * k; }
-  return { paid, straks, save: straks - paid, est };
+  for (const [ms, k] of it.plan) { const p = price(ms); if (p == null) return null; paid += p * k; kP += k; }
+  for (const [ms, k] of it.straks) { const p = price(ms); if (p == null) return null; straks += p * k; kB += k; }
+  // Er planen afbrudt (ny plan gemt), har den leveret en anden mængde strøm end Clever-metoden. Forskellen
+  // værdisættes til planens egen gennemsnitspris for de timer, der blev afløst, så besparelsen ikke skyldes udskudt ladning.
+  let rk = 0, rc = 0;
+  for (const [ms, k] of (it.rest || [])) { const p = price(ms); if (p == null) continue; rk += k; rc += p * k; }
+  const pi = rk > 0 ? rc / rk : kP > 0 ? paid / kP : 0;
+  const adj = (kB - kP) * pi;
+  return { paid, straks, save: straks - paid - adj, est };
 }
 function viewBesparelse() {
   const items = S.lad.map((it) => ({ it, r: evalItem(it) })).filter((x) => x.r);
@@ -289,19 +387,19 @@ function viewBesparelse() {
   const wk = Array.from({ length: 8 }, (_, k) => isoWeek(Date.now() - (7 - k) * 7 * 864e5));
   const vals = wk.map((w) => items.filter((x) => { const q = isoWeek(x.it.ts); return q.y === w.y && q.w === w.w; }).reduce((a, x) => a + x.r.save, 0));
   const mx = Math.max(1, ...vals);
-  let h = '<h1 style="padding:0 4px">Besparelse</h1><div class="sub" style="padding:0 4px">Beregnet ud fra de ladeplaner, du har gemt</div>' + banner();
+  let h = '<h1 style="padding:0 4px">Besparelse</h1><div class="sub" style="padding:0 4px">Beregnet ud fra de ladeplaner, du har gemt, i forhold til Clever-metoden</div>' + banner();
   if (!items.length) {
-    return h + '<section class="card"><h2>Ingen ladninger endnu</h2><p class="sub" style="margin:0">Når du trykker "Jeg følger planen" på Lad-skærmen, gemmer appen planen her. Den regner derefter ud, hvor meget du sparer i forhold til at lade med det samme, med de faktiske timepriser, efterhånden som de bliver kendt.</p></section>';
+    return h + '<section class="card"><h2>Ingen ladninger endnu</h2><p class="sub" style="margin:0">Når du trykker "Jeg følger planen" på Lad-skærmen, gemmer appen planen her. Den regner derefter ud, hvor meget du sparer i forhold til Clever-metoden (billigste timer et døgn ad gangen), med de faktiske timepriser, efterhånden som de bliver kendt.</p></section>';
   }
-  h += '<section class="hero"><div class="eyebrow">Sparet i alt</div><div class="total num">' + kr0(total) + ' kr</div><div class="text">' + items.length + ' ' + (items.length === 1 ? 'ladning' : 'ladninger') + ' gemt, sammenlignet med at lade med det samme</div>' +
+  h += '<section class="hero"><div class="eyebrow">Sparet i alt</div><div class="total num">' + kr0(total) + ' kr</div><div class="text">' + items.length + ' ' + (items.length === 1 ? 'ladning' : 'ladninger') + ' gemt, sammenlignet med Clever-metoden</div>' +
     '<div class="weeks">' + vals.map((v, k) => '<div' + (k === 7 ? ' class="now"' : '') + '><span class="v num">' + (v ? kr0(v) : '') + '</span><span class="b" style="height:' + Math.max(4, Math.round(Math.max(0, v) / mx * 64)) + 'px"></span><span class="w">u' + wk[k].w + '</span></div>').join('') + '</div></section>';
   h += '<section class="card list" style="gap:0;padding-bottom:6px"><h2 style="padding-bottom:6px">Seneste ladninger</h2>' +
     items.slice(0, 12).map(({ it, r }) => {
-      const a = it.plan[0][0];
-      return '<div class="item"><div class="l"><b>' + esc(dayName(a)) + '</b><span class="small">' + it.kwh + ' kWh, start kl. ' + hh(a) + ':00, ' + it.plan.length + ' timer' + (r.est ? ' · foreløbig' : '') + '</span></div>' +
+      const a = (it.plan[0] || it.straks[0])[0], kw = it.plan.reduce((q, x) => q + x[1], 0);
+      return '<div class="item"><div class="l"><b>' + esc(dayName(a)) + '</b><span class="small">' + nf(kw, 0) + ' kWh, ' + it.plan.length + ' timer' + (r.est ? ' · foreløbig' : '') + '</span></div>' +
         '<div class="r"><span class="big good-t num">' + (r.save >= 0 ? '+' : '−') + kr0(Math.abs(r.save)) + ' kr</span><span class="small num">' + kr0(r.paid) + ' mod ' + kr0(r.straks) + ' kr</span></div></div>';
     }).join('') + '</section>' +
-    '<p class="hint">Sparet er prisen for at lade med det samme minus prisen i de timer, du valgte. Det regnes med timepriser og er ikke målt på din måler. Ladninger, hvor priserne endnu er prognoser, er markeret foreløbige.</p>';
+    '<p class="hint">Sparet er prisen med Clever-metoden minus prisen for din plan. Det regnes med timepriser og er ikke målt på din måler. Ladninger, hvor priserne endnu er prognoser, er markeret foreløbige.</p>';
   return h;
 }
 
@@ -336,28 +434,37 @@ function viewIndstillinger() {
 /* ---------- render og hændelser ---------- */
 function render() {
   const v = document.getElementById('view'), r = S.route;
-  document.body.classList.toggle('subpage', r === 'indstillinger');
+  document.body.classList.toggle('subpage', r === 'indstillinger' || r === 'uge');
   document.querySelectorAll('#tabs a').forEach((a) => { if (a.dataset.tab === r) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); });
   if (S.err) { v.innerHTML = '<p class="err">' + esc(S.err) + '</p><button class="btn plain" data-act="retry">Prøv igen</button>'; return; }
   if (!S.D) { v.innerHTML = '<p class="loading">Henter priser ...</p>'; return; }
-  const views = { lad: viewLad, priser: viewPriser, besparelse: viewBesparelse, indstillinger: viewIndstillinger };
+  const views = { lad: viewLad, priser: viewPriser, besparelse: viewBesparelse, indstillinger: viewIndstillinger, uge: viewUge };
   v.innerHTML = (views[r] || viewLad)();
 }
 function route() {
   const r = (location.hash.replace(/^#\/?/, '') || 'lad');
-  S.route = ['lad', 'priser', 'besparelse', 'indstillinger'].includes(r) ? r : 'lad';
+  S.route = ['lad', 'priser', 'besparelse', 'indstillinger', 'uge'].includes(r) ? r : 'lad';
   render(); window.scrollTo(0, 0);
 }
 function gem() {
-  const P = planCalc(), D = S.D, s = S.s; if (P.err) return;
+  const P = planCalc(), D = S.D; if (P.err || P.verdict === 'Kan ikke nås') return;
   const pl = (m) => [...m.entries()].sort((a, b) => a[0] - b[0]).map(([i, k]) => [D.t0 + i * H, k]);
-  S.lad.unshift({ id: Date.now(), ts: Date.now(), kwh: s.kwh, eff: s.eff, dl: P.cur.dl, area: s.omraade, tillaeg: s.tillaeg, moms: s.moms, plan: pl(P.cheap), straks: pl(P.now_) });
+  const from = D.t0 + P.startI * H;
+  // Ældre gemte planer afløses fra nu af: de timer flyttes til "rest", så de ikke tælles to gange.
+  for (const it of S.lad) {
+    const gone = it.plan.filter(([ms]) => ms >= from);
+    it.rest = (it.rest || []).concat(gone);
+    it.plan = it.plan.filter(([ms]) => ms < from);
+    it.straks = it.straks.filter(([ms]) => ms < from);
+  }
+  S.lad = S.lad.filter((it) => it.plan.length || it.straks.length);
+  S.lad.unshift({ id: Date.now(), v: 2, ts: Date.now(), kwh: Math.round(P.kwhP * 10) / 10, area: S.s.omraade, tillaeg: S.s.tillaeg, moms: S.s.moms, plan: pl(P.plan), straks: pl(P.base), rest: [] });
   S.lad = S.lad.slice(0, 200); saveLad(); render();
 }
 function act(a, v) {
   const s = S.s;
-  if (a === 'kwh') { s.kwh = Math.max(5, Math.min(100, s.kwh + Number(v))); saveSettings(); }
-  else if (a === 'dag') { s.dag = Number(v); saveSettings(); }
+  if (a === 'ukwh') { const [d, dl] = v.split(':').map(Number); s.uge[d].kwh = Math.max(0, Math.min(100, s.uge[d].kwh + dl)); saveSettings(); }
+  else if (a === 'away') { s.uge[Number(v)].away = !s.uge[Number(v)].away; saveSettings(); }
   else if (a === 'gem') { gem(); return; }
   else if (a === 'omraade') { s.omraade = v; saveSettings(); prep(); }
   else if (a === 'net') { s.net = v; saveSettings(); prep(); }
@@ -370,16 +477,28 @@ document.addEventListener('click', (e) => { const b = e.target.closest('[data-ac
 document.addEventListener('input', (e) => {
   const t = e.target;
   if (t.dataset.in === 'netfilter') { S.netFilter = t.value; const l = document.getElementById('netlist'); if (l) l.innerHTML = netListHtml(); }
+  else if (t.dataset.in === 'soc') { S.s.soc = Number(t.value); const o = document.getElementById('socout'); if (o) o.textContent = S.s.soc + ' % · ' + Math.round(S.s.bat * S.s.soc / 100) + ' kWh'; }
 });
 document.addEventListener('change', (e) => {
   const t = e.target, s = S.s;
-  if (t.dataset.in === 'tid' && /^\d{2}:\d{2}$/.test(t.value)) { s.tid = t.value; saveSettings(); render(); }
+  if (t.dataset.in === 'soc') { s.soc = Number(t.value); s.socTs = Date.now(); saveSettings(); render(); }
+  else if (t.dataset.in === 'uge') {
+    const u = s.uge[Number(t.dataset.day)], f = t.dataset.f, old = u[f];
+    if (/^\d{2}:\d{2}$/.test(t.value)) u[f] = t.value;
+    if (hmMin(u.fra) >= hmMin(u.til)) u[f] = old;
+    saveSettings(); render();
+  }
+  else if (['bat', 'minP', 'maxP'].includes(t.dataset.in)) {
+    const v = parseFloat(String(t.value).replace(',', '.')), k = t.dataset.in;
+    if (v >= Number(t.min) && v <= Number(t.max)) { s[k] = v; if (s.minP >= s.maxP) { if (k === 'minP') s.minP = Math.max(0, s.maxP - 5); else s.maxP = Math.min(100, s.minP + 5); } saveSettings(); }
+    render();
+  }
   else if (t.dataset.in === 'eff') { const v = parseFloat(String(t.value).replace(',', '.')); if (v >= 1 && v <= 50) { s.eff = v; saveSettings(); } render(); }
   else if (t.dataset.in === 'tillaeg') { const v = parseFloat(String(t.value).replace(',', '.')); if (v >= 0 && v <= 5) { s.tillaeg = v; saveSettings(); prep(); } render(); }
 });
 window.addEventListener('hashchange', route);
-document.addEventListener('visibilitychange', () => { if (!document.hidden && S.prog) { prep(); if (S.route !== 'indstillinger') render(); } });
-setInterval(() => { if (S.prog && S.route !== 'indstillinger' && !document.hidden) { prep(); render(); } }, 60000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden && S.prog) { prep(); if (S.route !== 'indstillinger' && S.route !== 'uge') render(); } });
+setInterval(() => { if (S.prog && S.route !== 'indstillinger' && S.route !== 'uge' && !document.hidden) { prep(); render(); } }, 60000);
 
 if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => {});
 route();

@@ -50,7 +50,8 @@ python -m http.server 8000
 ## Det skal du vide
 
 - **Prognosen er et skøn.** Kun priserne for i dag og i morgen er endelige. Resten er en model med et usikkerhedsinterval. Vurder selv modellen med `--backtest`.
-- **Besparelsen i appen er beregnet, ikke målt.** Den sammenligner dine valgte timer med at lade med det samme, med timepriser. Den læser ikke din bil eller måler.
+- **Planen tager højde for din uge.** Du angiver batteriniveau nu, forventet forbrug pr. ugedag og hvornår bilen er væk (der lades ikke da). Appen finder den billigste plan for de næste ca. 4 dage, så ture altid kan nås, og batteriet holder sig mellem reserve og ladegrænse.
+- **Besparelsen sammenlignes med Clever-metoden.** Den antager, at Clever planlægger billigste timer et døgn ad gangen. Appen tjekker, om det kan betale sig at vente til en senere nat. Besparelsen er beregnet med timepriser, ikke målt. Den læser ikke din bil eller måler.
 - **Tariffer vælges automatisk** som den almindelige "Nettarif C" hos dit netselskab. Netselskaber navngiver forskelligt, så tjek mod din regning. Netselskaber uden en tydelig forbrugstarif er sprunget over.
 - **Leverandørens tillæg** står ikke i de åbne data. Det skal du selv skrive ind under Indstillinger.
 - Appen sender ikke notifikationer. Sæt bilens eller laderens timer efter anbefalingen.
