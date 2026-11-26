@@ -18,6 +18,7 @@ const DEF = { omraade: 'DK2', net: null, eff: 11, tillaeg: 0, moms: true, bat: 6
 const S = { prog: null, tar: null, D: null, err: null, route: 'lad', netFilter: '',
   s: Object.assign({}, DEF, store.get('settings', {})), lad: store.get('ladninger', []).filter((x) => x.v === 2) };
 if (!Array.isArray(S.s.uge) || S.s.uge.length !== 7) S.s.uge = DEF.uge;
+if (!S.s.socTs) { S.s.socTs = Date.now(); store.set('settings', S.s); }
 S.s.uge.forEach((u) => { if (u.km == null) u.km = Math.round((u.kwh || 0) / (S.s.fk / 100) / 5) * 5; delete u.kwh; });
 const dagKwh = (u) => u.km * S.s.fk / 100;
 const saveSettings = () => store.set('settings', S.s);
@@ -108,6 +109,25 @@ const sumMap = (m) => { let a = 0; m.forEach((k) => { a += k; }); return a; };
 const costOf = (m, arr) => { let c = 0; m.forEach((k, i) => { c += k * arr[i]; }); return c; };
 const dowOf = (ms) => { const p = lp(ms); return (new Date(Date.UTC(p.year, p.month - 1, p.day)).getUTCDay() + 6) % 7; };
 
+/* Batteriniveau nu: sidste aflæsning minus forbrug på ture siden da. Fratrækket vises, når bilen er hjemme igen
+   (ugeplanens "hjemme"-tid). Planlægningen trækker turen fra, så snart bilen er kørt. */
+function effSoc(now) {
+  const s = S.s, bat = Math.max(10, s.bat), t0 = s.socTs || now;
+  let shown = 0, drive = 0;
+  const p0 = lp(t0);
+  for (let k = 0; k <= 14; k++) {
+    const d = addDays(p0.year, p0.month, p0.day, k), ms0 = localToUtc(d.y, d.m, d.d, 12, 0), u = s.uge[dowOf(ms0)];
+    if (!(u.km > 0)) continue;
+    const [fh, fm] = (u.away ? u.fra : '12:00').split(':').map(Number), [th, tm] = (u.away ? u.til : '12:00').split(':').map(Number);
+    const dep = localToUtc(d.y, d.m, d.d, fh, fm), home = localToUtc(d.y, d.m, d.d, th, tm);
+    if (dep <= t0 || dep > now) continue;
+    drive += dagKwh(u);
+    if (home <= now) shown += dagKwh(u);
+  }
+  const cur = Math.max(0, bat * s.soc / 100 - shown);
+  return { kwh: cur, pct: Math.round(cur / bat * 100), shown, plan: Math.max(0, cur - (drive - shown)) };
+}
+
 /* Ture og tidspunkter, hvor bilen er hjemme, ud fra ugeplanen. */
 function buildSchedule(startI) {
   const D = S.D, uge = S.s.uge, ev = {}, away = new Set(), info = [];
@@ -143,7 +163,7 @@ function planCalc() {
   const bat = Math.max(10, s.bat), minK = bat * s.minP / 100, maxK = Math.max(minK, bat * s.maxP / 100);
   const avg = s.uge.reduce((a, u) => a + dagKwh(u), 0) / 7;
   const { ev, away } = buildSchedule(startI);
-  const cfg = { startI, N, price: D.T.md, eff: s.eff, bat, soc: Math.min(bat, bat * s.soc / 100), minK, maxK,
+  const cfg = { startI, N, price: D.T.md, eff: s.eff, bat, soc: Math.min(bat, effSoc(now).plan), minK, maxK,
     endK: Math.min(maxK, minK + avg), ev, avail: (i) => !away.has(i) };
   const plan = Planner.optimize(cfg), base = Planner.rolling(cfg);
   const simP = Planner.simulate(cfg, plan), simB = Planner.simulate(cfg, base), T = D.T;
@@ -252,10 +272,11 @@ function viewLad() {
       '<div class="tile"><span class="label">Ladeplan</span><b class="num">' + kr0(P.cP) + ' kr</b></div>' +
       '<div class="tile good"><span class="label">Du sparer</span><b class="num">' + kr0(P.sav) + ' kr</b></div></div>';
   }
-  const kwhNow = Math.round(s.bat * s.soc / 100);
-  const stale = s.socTs && now - s.socTs > 4 * H ? '<p class="warn">Niveauet er ' + Math.round((now - s.socTs) / H) + ' timer gammelt. Opdater det for en rigtig plan.</p>' : '';
-  h += '<section class="card"><div class="row"><h2>Batteri nu</h2><output class="num big-out" id="socout">' + s.soc + ' % · ' + kwhNow + ' kWh</output></div>' +
-    '<input type="range" min="0" max="100" step="1" value="' + s.soc + '" data-in="soc" aria-label="Batteriniveau i procent">' + stale +
+  const es = effSoc(now), kwhNow = Math.round(es.kwh);
+  const stale = es.shown > 0.05 ? '<p class="sub" style="margin:0">Aflæst for ' + Math.round((now - s.socTs) / H) + ' timer siden, minus ' + nf(es.shown, 1) + ' kWh til ture siden. Justér skyderen, hvis bilen har ladet.</p>'
+    : s.socTs && now - s.socTs > 12 * H ? '<p class="warn">Niveauet er ' + Math.round((now - s.socTs) / H) + ' timer gammelt. Opdater det for en rigtig plan.</p>' : '';
+  h += '<section class="card"><div class="row"><h2>Batteri nu</h2><output class="num big-out" id="socout">' + es.pct + ' % · ' + kwhNow + ' kWh</output></div>' +
+    '<input type="range" min="0" max="100" step="1" value="' + es.pct + '" data-in="soc" aria-label="Batteriniveau i procent">' + stale +
     '<div class="row"><span class="sub">Ladegrænse ' + s.maxP + ' %, reserve ' + s.minP + ' %, ' + s.bat + ' kWh</span><a class="link-btn" href="#/uge">Uge og ladetider</a></div></section>';
   if (!P.err && !P.verdict.startsWith('Kan ikke')) {
     const T = D.T.md, idx = []; for (let i = P.startI; i < P.N; i++) idx.push(i);

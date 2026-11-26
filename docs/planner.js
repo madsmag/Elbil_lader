@@ -14,7 +14,7 @@
     let cur = new Float64Array(J).fill(Infinity), nxt = new Float64Array(J);
     cur[Math.min(c.j0, c.jMax)] = 0;
     const prev = new Int16Array(n * J);
-    const es = (i) => Math.round((c.ev[i] || 0) / STEP);
+    const es = (i) => Math.ceil((c.ev[i] || 0) / STEP - 1e-9);   // rund forbrug op, så planen aldrig er for optimistisk
     for (let k = 0; k < n; k++) {
       const i = c.i0 + k, e = es(i), can = i < c.lastCharge && c.avail(i), px = c.price[i];
       nxt.fill(Infinity);
@@ -50,7 +50,7 @@
     const bat = cfg.bat;
     return {
       price: cfg.price, eff: cfg.eff, jMax: Math.floor(bat / STEP + 1e-9), capJ: Math.floor(cfg.maxK / STEP + 1e-9),
-      minJ: Math.ceil(cfg.minK / STEP - 1e-9), endJ: Math.round(cfg.endK / STEP), j0: Math.round(cfg.soc / STEP),
+      minJ: Math.ceil(cfg.minK / STEP - 1e-9), endJ: Math.round(cfg.endK / STEP), j0: Math.floor(cfg.soc / STEP + 1e-9),
       avail: cfg.avail, ev: cfg.ev,
     };
   }
