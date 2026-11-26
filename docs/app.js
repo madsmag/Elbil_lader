@@ -281,9 +281,11 @@ function viewLad() {
 
 function viewUge() {
   const s = S.s;
-  const days = s.uge.map((u, d) => {
+  const dow0 = dowOf(Date.now());
+  const days = Array.from({ length: 7 }, (_, k) => (dow0 + k) % 7).map((d, k) => {
+    const u = s.uge[d], titel = UGEDAGE[d] + (k === 0 ? ' · i dag' : k === 1 ? ' · i morgen' : '');
     const t = (f, v) => '<input type="time" value="' + esc(v) + '" data-in="uge" data-day="' + d + '" data-f="' + f + '" aria-label="' + UGEDAGE[d] + (f === 'fra' ? ' kører' : ' hjemme igen') + '">';
-    return '<section class="card"><div class="row"><h2>' + UGEDAGE[d] + '</h2><div class="stepper"><button data-act="ukm" data-v="' + d + ':-5" aria-label="Mindre">−</button>' +
+    return '<section class="card"><div class="row"><h2>' + titel + '</h2><div class="stepper"><button data-act="ukm" data-v="' + d + ':-5" aria-label="Mindre">−</button>' +
       '<output class="num">' + u.km + ' km</output><button data-act="ukm" data-v="' + d + ':5" aria-label="Mere">+</button></div></div>' +
       '<div class="row" style="min-height:44px"><div><div style="font-weight:500">Bilen er væk</div><div class="small label" style="font-weight:400">' + (u.away ? 'Der lades ikke i dette tidsrum' : 'Hjemme hele dagen, kan lade når som helst') + '</div></div>' +
       '<button class="switch" role="switch" aria-checked="' + u.away + '" aria-label="' + UGEDAGE[d] + ' væk" data-act="away" data-v="' + d + '"></button></div>' +
