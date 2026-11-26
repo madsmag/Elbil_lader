@@ -12,12 +12,14 @@ const store = {
   get(k, d) { try { const v = localStorage.getItem('el.' + k); return v ? JSON.parse(v) : d; } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem('el.' + k, JSON.stringify(v)); } catch (e) { /* privat tilstand */ } },
 };
-const dagUge = (kwh, away) => ({ kwh, away, fra: '07:00', til: '17:00' });
+const dagUge = (km, away) => ({ km, away, fra: '07:00', til: '17:00' });
 const DEF = { omraade: 'DK2', net: null, eff: 11, tillaeg: 0, moms: true, bat: 60, soc: 50, socTs: 0, minP: 20, maxP: 80,
-  uge: [dagUge(12, true), dagUge(12, true), dagUge(12, true), dagUge(12, true), dagUge(12, true), dagUge(8, false), dagUge(8, false)] };
+  fk: 18, uge: [dagUge(60, true), dagUge(60, true), dagUge(60, true), dagUge(60, true), dagUge(60, true), dagUge(40, false), dagUge(40, false)] };
 const S = { prog: null, tar: null, D: null, err: null, route: 'lad', netFilter: '',
   s: Object.assign({}, DEF, store.get('settings', {})), lad: store.get('ladninger', []).filter((x) => x.v === 2) };
 if (!Array.isArray(S.s.uge) || S.s.uge.length !== 7) S.s.uge = DEF.uge;
+S.s.uge.forEach((u) => { if (u.km == null) u.km = Math.round((u.kwh || 0) / (S.s.fk / 100) / 5) * 5; delete u.kwh; });
+const dagKwh = (u) => u.km * S.s.fk / 100;
 const saveSettings = () => store.set('settings', S.s);
 const saveLad = () => store.set('ladninger', S.lad);
 
@@ -113,8 +115,8 @@ function buildSchedule(startI) {
     const ms = D.t0 + i * H, p = lp(ms), u = uge[dowOf(ms)], m = p.hour * 60, fra = hmMin(u.fra), til = hmMin(u.til);
     if (u.away && fra < til) {
       if (m < til && m + 60 > fra) away.add(i);
-      if (m <= fra && fra < m + 60 && u.kwh > 0) ev[i] = (ev[i] || 0) + u.kwh;
-    } else if (p.hour === 12 && u.kwh > 0) ev[i] = (ev[i] || 0) + u.kwh;
+      if (m <= fra && fra < m + 60 && u.km > 0) ev[i] = (ev[i] || 0) + dagKwh(u);
+    } else if (p.hour === 12 && u.km > 0) ev[i] = (ev[i] || 0) + dagKwh(u);
   }
   return { ev, away };
 }
@@ -139,7 +141,7 @@ function planCalc() {
   const startI = Math.max(0, Math.ceil((now - D.t0) / H)), N = D.N;
   if (N - startI < 8) { P.err = 'Prognosen rækker for kort frem. Prøv igen om lidt.'; return P; }
   const bat = Math.max(10, s.bat), minK = bat * s.minP / 100, maxK = Math.max(minK, bat * s.maxP / 100);
-  const avg = s.uge.reduce((a, u) => a + u.kwh, 0) / 7;
+  const avg = s.uge.reduce((a, u) => a + dagKwh(u), 0) / 7;
   const { ev, away } = buildSchedule(startI);
   const cfg = { startI, N, price: D.T.md, eff: s.eff, bat, soc: Math.min(bat, bat * s.soc / 100), minK, maxK,
     endK: Math.min(maxK, minK + avg), ev, avail: (i) => !away.has(i) };
@@ -228,7 +230,7 @@ function dayRows(P) {
     const ms0 = D.t0 + g[0] * H, u = S.s.uge[dowOf(ms0)];
     const kp = g.reduce((a, i) => a + (P.plan.get(i) || 0), 0), kb = g.reduce((a, i) => a + (P.base.get(i) || 0), 0);
     const rs = runs(P.plan, g[0], g[g.length - 1] + 1).map((r) => pad(Number(hh(D.t0 + r.from * H))) + '–' + pad(Number(hh(D.t0 + r.to * H)) % 24)).join(', ');
-    const use = u.away ? 'Væk ' + u.fra + '–' + u.til + ', ' + u.kwh + ' kWh' : 'Hjemme, ' + u.kwh + ' kWh';
+    const use = u.away ? 'Væk ' + u.fra + '–' + u.til + ', ' + u.km + ' km' : 'Hjemme, ' + u.km + ' km';
     const c = g.reduce((a, i) => a + (P.plan.get(i) || 0) * D.T.md[i], 0);
     return '<div class="item"><div class="l"><b>' + esc(dayName(ms0)) + '</b><span class="small">' + esc(use) + '</span></div>' +
       '<div class="r"><span class="big num">' + (kp > 0.05 ? nf(kp, kp % 1 ? 1 : 0) + ' kWh' : 'Ingen') + '</span><span class="small num">' +
@@ -281,17 +283,18 @@ function viewUge() {
   const s = S.s;
   const days = s.uge.map((u, d) => {
     const t = (f, v) => '<input type="time" value="' + esc(v) + '" data-in="uge" data-day="' + d + '" data-f="' + f + '" aria-label="' + UGEDAGE[d] + (f === 'fra' ? ' kører' : ' hjemme igen') + '">';
-    return '<section class="card"><div class="row"><h2>' + UGEDAGE[d] + '</h2><div class="stepper"><button data-act="ukwh" data-v="' + d + ':-1" aria-label="Mindre">−</button>' +
-      '<output class="num">' + u.kwh + ' kWh</output><button data-act="ukwh" data-v="' + d + ':1" aria-label="Mere">+</button></div></div>' +
+    return '<section class="card"><div class="row"><h2>' + UGEDAGE[d] + '</h2><div class="stepper"><button data-act="ukm" data-v="' + d + ':-5" aria-label="Mindre">−</button>' +
+      '<output class="num">' + u.km + ' km</output><button data-act="ukm" data-v="' + d + ':5" aria-label="Mere">+</button></div></div>' +
       '<div class="row" style="min-height:44px"><div><div style="font-weight:500">Bilen er væk</div><div class="small label" style="font-weight:400">' + (u.away ? 'Der lades ikke i dette tidsrum' : 'Hjemme hele dagen, kan lade når som helst') + '</div></div>' +
       '<button class="switch" role="switch" aria-checked="' + u.away + '" aria-label="' + UGEDAGE[d] + ' væk" data-act="away" data-v="' + d + '"></button></div>' +
-      (u.away ? '<div class="row"><span class="label">Kører kl.</span>' + t('fra', u.fra) + '<span class="label">Hjemme kl.</span>' + t('til', u.til) + '</div>' : '') + '</section>';
+      (u.away ? '<div class="tider"><label><span class="label">Kører kl.</span>' + t('fra', u.fra) + '</label><label><span class="label">Hjemme kl.</span>' + t('til', u.til) + '</label></div>' : '') + '</section>';
   }).join('');
   const num = (id, label, sub, val, min, max, step) => '<div class="row"><div><label for="' + id + '">' + label + '</label><div class="small label" style="font-weight:400">' + sub + '</div></div>' +
     '<input id="' + id + '" type="number" inputmode="decimal" min="' + min + '" max="' + max + '" step="' + step + '" value="' + val + '" data-in="' + id + '"></div>';
-  return '<a class="back" href="#/lad">' + ICON.back + 'Tilbage</a><h1 style="padding:0 4px">Uge og ladetider</h1>' +
-    '<div class="sub" style="padding:0 4px">Forventet forbrug pr. dag og tidspunkter, hvor bilen ikke kan lade. Forbruget trækkes, når du kører hjemmefra.</div>' + banner() +
+  return '<h1 style="padding:0 4px">Uge og ladetider</h1>' +
+    '<div class="sub" style="padding:0 4px">Hvor langt du kører pr. dag, og hvornår bilen ikke kan lade. Strømmen til turen trækkes, når du kører hjemmefra.</div>' + banner() +
     '<section class="card"><h2>Bil</h2>' + num('bat', 'Batteristørrelse (kWh)', 'Brugbar kapacitet', s.bat, 10, 200, 1) +
+    num('fk', 'Forbrug (kWh pr. 100 km)', 'Se bilens computer, fx 18', s.fk, 8, 60, 0.5) +
     num('minP', 'Reserve (%)', 'Må helst ikke gå under', s.minP, 0, 90, 1) + num('maxP', 'Ladegrænse (%)', 'Lad ikke højere', s.maxP, 20, 100, 1) + '</section>' + days;
 }
 
@@ -434,7 +437,7 @@ function viewIndstillinger() {
 /* ---------- render og hændelser ---------- */
 function render() {
   const v = document.getElementById('view'), r = S.route;
-  document.body.classList.toggle('subpage', r === 'indstillinger' || r === 'uge');
+  document.body.classList.toggle('subpage', r === 'indstillinger');
   document.querySelectorAll('#tabs a').forEach((a) => { if (a.dataset.tab === r) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current'); });
   if (S.err) { v.innerHTML = '<p class="err">' + esc(S.err) + '</p><button class="btn plain" data-act="retry">Prøv igen</button>'; return; }
   if (!S.D) { v.innerHTML = '<p class="loading">Henter priser ...</p>'; return; }
@@ -463,7 +466,7 @@ function gem() {
 }
 function act(a, v) {
   const s = S.s;
-  if (a === 'ukwh') { const [d, dl] = v.split(':').map(Number); s.uge[d].kwh = Math.max(0, Math.min(100, s.uge[d].kwh + dl)); saveSettings(); }
+  if (a === 'ukm') { const [d, dl] = v.split(':').map(Number); s.uge[d].km = Math.max(0, Math.min(1000, s.uge[d].km + dl)); saveSettings(); }
   else if (a === 'away') { s.uge[Number(v)].away = !s.uge[Number(v)].away; saveSettings(); }
   else if (a === 'gem') { gem(); return; }
   else if (a === 'omraade') { s.omraade = v; saveSettings(); prep(); }
@@ -488,7 +491,7 @@ document.addEventListener('change', (e) => {
     if (hmMin(u.fra) >= hmMin(u.til)) u[f] = old;
     saveSettings(); render();
   }
-  else if (['bat', 'minP', 'maxP'].includes(t.dataset.in)) {
+  else if (['bat', 'minP', 'maxP', 'fk'].includes(t.dataset.in)) {
     const v = parseFloat(String(t.value).replace(',', '.')), k = t.dataset.in;
     if (v >= Number(t.min) && v <= Number(t.max)) { s[k] = v; if (s.minP >= s.maxP) { if (k === 'minP') s.minP = Math.max(0, s.maxP - 5); else s.maxP = Math.min(100, s.minP + 5); } saveSettings(); }
     render();

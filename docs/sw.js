@@ -1,6 +1,6 @@
 'use strict';
 // Skallen caches (stale-while-revalidate), data hentes netværk først, så priserne er friske.
-const VERSION = 'v2';
+const VERSION = 'v3';
 const SHELL = ['./', 'index.html', 'app.css', 'app.js', 'planner.js', 'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-192.png'];
 
 self.addEventListener('install', (e) => {
